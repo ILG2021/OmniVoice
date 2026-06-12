@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import random
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
@@ -48,6 +49,22 @@ import webdataset as wds
 
 from omnivoice.utils.audio import load_audio, load_audio_bytes
 from torch.utils.data import IterableDataset
+
+
+def _to_file_uri(path: str) -> str:
+    """Normalize a local file path for WebDataset's gopen on Windows.
+
+    WebDataset uses ``urlparse`` to detect the URL scheme.  On Windows,
+    ``urlparse("D:/foo.tar")`` mis-identifies ``D`` as the scheme, so gopen
+    finds no handler.  Prepending ``file:`` fixes this:
+    ``urlparse("file:D:/foo.tar")`` correctly yields scheme=``file`` and
+    path=``D:/foo.tar``, which WebDataset's file handler opens normally.
+    """
+    path = path.replace("\\", "/")
+    # Windows absolute path like D:/foo → file:D:/foo
+    if re.match(r"^[A-Za-z]:/", path):
+        return "file:" + path
+    return path
 
 
 def load_audio_webdataset(data, sample_rate: int = 24000, device="cpu"):
@@ -177,7 +194,7 @@ def webdataset_manifest_reader(
                     "tar_path, label_jsonl_path, num_items, num_seconds."
                 )
             tar_path, label_jsonl_path, num_items, num_seconds = (
-                parts[0].replace("\\", "/"),
+                _to_file_uri(parts[0]),
                 parts[1].replace("\\", "/"),
                 int(parts[2]),
                 float(parts[3]),
