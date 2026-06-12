@@ -200,7 +200,21 @@ class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
     _supports_sdpa = True
+    supports_gradient_checkpointing = True
     config_class = OmniVoiceConfig
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Delegate gradient checkpointing to the inner LLM backbone."""
+        if hasattr(self.llm, "gradient_checkpointing_enable"):
+            self.llm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
+
+    def gradient_checkpointing_disable(self):
+        """Delegate gradient checkpointing disable to the inner LLM backbone."""
+        if hasattr(self.llm, "gradient_checkpointing_disable"):
+            self.llm.gradient_checkpointing_disable()
+
 
     def __init__(self, config: OmniVoiceConfig, llm: Optional[PreTrainedModel] = None):
         super().__init__(config)
