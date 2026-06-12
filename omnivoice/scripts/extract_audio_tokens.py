@@ -209,6 +209,11 @@ def _resolve_tokenizer_path(name_or_path: str) -> str:
     return sub if os.path.isdir(sub) else local_dir
 
 
+def _to_posix(path: str) -> str:
+    """Convert a path to forward-slash notation for WebDataset compatibility."""
+    return path.replace("\\", "/")
+
+
 def process_init(rank_queue, tokenizer_path):
     """
     Initialization function for each worker process.
@@ -510,8 +515,8 @@ def main() -> None:
         if shard_idx > 0 and shard_sample_count > 0:
             prev_idx = shard_idx - 1
             shard_manifest[prev_idx] = (
-                os.path.abspath(tar_output_pattern % prev_idx),
-                os.path.abspath(jsonl_output_pattern % prev_idx),
+                _to_posix(os.path.abspath(tar_output_pattern % prev_idx)),
+                _to_posix(os.path.abspath(jsonl_output_pattern % prev_idx)),
                 shard_sample_count,
                 shard_duration,
             )
@@ -619,8 +624,8 @@ def main() -> None:
         if shard_idx > 0 and shard_sample_count > 0:
             last_idx = shard_idx - 1
             shard_manifest[last_idx] = (
-                os.path.abspath(tar_output_pattern % last_idx),
-                os.path.abspath(jsonl_output_pattern % last_idx),
+                _to_posix(os.path.abspath(tar_output_pattern % last_idx)),
+                _to_posix(os.path.abspath(jsonl_output_pattern % last_idx)),
                 shard_sample_count,
                 shard_duration,
             )

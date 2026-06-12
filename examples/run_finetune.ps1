@@ -66,6 +66,12 @@ if ($stage -le 0 -and $stop_stage -ge 0) {
 
         $split_name      = $s.name
         $split_jsonl_path = $s.jsonl
+        $manifest        = "$TOKEN_DIR/$split_name/data.lst"
+
+        if (Test-Path $manifest) {
+            Write-Host "  Skipping $split_name – $manifest already exists."
+            continue
+        }
 
         Write-Host "  Tokenizing $split_name from $split_jsonl_path"
 
@@ -83,7 +89,7 @@ if ($stage -le 0 -and $stop_stage -ge 0) {
             exit $LASTEXITCODE
         }
 
-        Write-Host "  Done. Manifest written to $TOKEN_DIR/$split_name/data.lst"
+        Write-Host "  Done. Manifest written to $manifest"
     }
 }
 
