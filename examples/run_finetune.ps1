@@ -10,8 +10,8 @@ $stop_stage = 1
 
 # ====== Modify as needed ======
 # GPUs to use
-$GPU_IDS  = "0,1"
-$NUM_GPUS = 2
+$GPU_IDS  = "0"
+$NUM_GPUS = 1
 
 # Path to your input JSONL file
 # (each line: {"id": ..., "audio_path": ..., "text": ..., "language_id": ...})
@@ -75,7 +75,7 @@ if ($stage -le 0 -and $stop_stage -ge 0) {
             --input_jsonl        $split_jsonl_path `
             --tar_output_pattern  "$TOKEN_DIR/$split_name/audios/shard-%06d.tar" `
             --jsonl_output_pattern "$TOKEN_DIR/$split_name/txts/shard-%06d.jsonl" `
-            --nj_per_gpu         3 `
+            --nj_per_gpu         1 `
             --shuffle            True
 
         if ($LASTEXITCODE -ne 0) {
