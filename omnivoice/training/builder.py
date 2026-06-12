@@ -211,7 +211,7 @@ def build_dataloaders(
         collate_fn=collate_fn,
         worker_init_fn=init_fn,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=4 if config.num_workers > 0 else None,
     )
 
     eval_loader = None
@@ -219,6 +219,7 @@ def build_dataloaders(
         raw_dev_ds = WebDatasetReader(
             manifests=dev_manifests, evaluation=True
         )
+        eval_num_workers = min(1, config.num_workers)
         if use_packing:
             dev_dataset = PackingIterableDataset(
                 raw_dev_ds, processor, config.batch_tokens
@@ -231,15 +232,15 @@ def build_dataloaders(
                 max_length=config.max_sample_tokens,
                 max_sample=config.max_batch_size,
                 processor=processor,
-                length_fn=lambda s: s["length"],
+                length_fn=_get_sample_length,
             )
         eval_loader = DataLoader(
             dev_dataset,
             batch_size=None,  # Each item is already a collated batch
-            num_workers=1,
+            num_workers=eval_num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
-            prefetch_factor=2,
+            prefetch_factor=2 if eval_num_workers > 0 else None,
         )
 
     return train_loader, eval_loader
