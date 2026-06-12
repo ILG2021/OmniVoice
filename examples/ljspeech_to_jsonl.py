@@ -79,6 +79,11 @@ def parse_metadata(metadata_path: Path, use_normalized: bool, audio_ext: str, wa
                 continue
 
             stem = parts[0].strip()
+            # Sanitize: strip file extension (some CSVs include ".wav" in the
+            # stem column) and replace '/' with '_'.  The tokeniser uses this
+            # value as both the tar key and the JSONL id, so it must not contain
+            # characters that are special inside a tar archive.
+            sanitized_id = os.path.splitext(stem)[0].replace("/", "_")
 
             # Column selection
             if use_normalized and len(parts) >= 3 and parts[2].strip():
@@ -86,14 +91,14 @@ def parse_metadata(metadata_path: Path, use_normalized: bool, audio_ext: str, wa
             else:
                 text = parts[1].strip()
 
-            # Resolve absolute audio path
+            # Resolve absolute audio path (stem may or may not include extension)
             audio_path = wavs_dir / stem
             if not audio_path.exists():
                 missing_audio.append(str(audio_path))
                 continue
 
             records.append({
-                "id": stem,
+                "id": sanitized_id,
                 "audio_path": str(audio_path.resolve()),
                 "text": text,
             })
