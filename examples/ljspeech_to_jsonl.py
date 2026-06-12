@@ -87,7 +87,7 @@ def parse_metadata(metadata_path: Path, use_normalized: bool, audio_ext: str, wa
                 text = parts[1].strip()
 
             # Resolve absolute audio path
-            audio_path = wavs_dir / f"{stem}.{audio_ext}"
+            audio_path = wavs_dir / stem
             if not audio_path.exists():
                 missing_audio.append(str(audio_path))
                 continue
@@ -150,11 +150,11 @@ def main():
         help="Random seed used for the train/dev split.",
     )
     parser.add_argument(
-        "--language_id", type=str, default="en",
+        "--language_id", type=str, default="zh",
         help="language_id to embed in every JSONL record.",
     )
     parser.add_argument(
-        "--use_normalized", action="store_true", default=True,
+        "--use_normalized", action="store_true", 
         help="Use the normalised transcription column (column 3) when available. "
              "Pass --no_use_normalized to use the raw column instead.",
     )
