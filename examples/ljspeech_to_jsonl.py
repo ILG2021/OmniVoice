@@ -22,7 +22,7 @@ Usage
     python examples/ljspeech_to_jsonl.py \\
         --dataset_dir  /path/to/LJSpeech-1.1 \\
         --output_dir   data/ljspeech \\
-        --dev_ratio    0.02 \\
+        --dev_count    100 \\
         --seed         42 \\
         --language_id  en \\
         --use_normalized
@@ -31,8 +31,8 @@ Arguments
 ---------
     --dataset_dir     Root of the LJSpeech dataset (contains metadata.csv and wavs/).
     --output_dir      Directory where train.jsonl and dev.jsonl will be written.
-    --dev_ratio       Fraction of samples to use for dev set (default: 0.02).
-                      Set to 0 to skip the dev split and write a single train.jsonl.
+    --dev_count       Number of samples to hold out for the dev set (default: 100).
+                      Set to 0 or use --no_split to write a single train.jsonl.
     --seed            Random seed for the train/dev split (default: 42).
     --language_id     language_id field in the output JSONL (default: en).
     --use_normalized  If set, use the 3rd column (normalised text); otherwise use
@@ -141,9 +141,9 @@ def main():
         help="Directory where train.jsonl (and optionally dev.jsonl) will be written.",
     )
     parser.add_argument(
-        "--dev_ratio", type=float, default=0.02,
-        help="Fraction of samples to hold out for the dev set (default: 0.02). "
-             "Set to 0 to skip the dev split and output a single train.jsonl instead.",
+        "--dev_count", type=int, default=100,
+        help="Number of samples to hold out for the dev set (default: 100). "
+             "Set to 0 or use --no_split to output a single train.jsonl instead.",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -211,24 +211,25 @@ def main():
     # ------------------------------------------------------------------
     output_dir: Path = args.output_dir.resolve()
 
-    if args.no_split or args.dev_ratio <= 0.0:
-        out_path = output_dir / "output.jsonl"
+    if args.no_split or args.dev_count <= 0:
+        out_path = output_dir / "train.jsonl"
         write_jsonl(records, out_path, args.language_id)
         print("\nDone.")
         return
+
+    n_dev = args.dev_count
+    if n_dev >= len(records):
+        parser.error(f"--dev_count ({n_dev}) must be less than total samples ({len(records)}).")
 
     # Reproducible shuffle then split
     rng = random.Random(args.seed)
     shuffled = records[:]
     rng.shuffle(shuffled)
 
-    n_dev = max(1, int(len(shuffled) * args.dev_ratio))
-    n_dev = min(n_dev, len(shuffled) - 1)  # keep at least 1 training sample
-
     dev_records   = shuffled[:n_dev]
     train_records = shuffled[n_dev:]
 
-    print(f"\n  Split (seed={args.seed}, dev_ratio={args.dev_ratio}):")
+    print(f"\n  Split (seed={args.seed}, dev_count={n_dev}):")
     print(f"    train: {len(train_records):,} samples")
     print(f"    dev  : {len(dev_records):,} samples")
     print()
