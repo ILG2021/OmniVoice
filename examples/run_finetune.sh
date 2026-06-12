@@ -22,8 +22,6 @@ DEV_JSONL="data/my_data_dev.jsonl"
 # Directory to write tokenized WebDataset shards
 TOKEN_DIR="data/finetune/tokens"
 
-# Audio tokenizer model (HuggingFace repo or local path)
-TOKENIZER_PATH="eustlb/higgs-audio-v2-tokenizer"
 
 # Training config file
 # If you encounter issues with flex_attention on your GPU, use the SDPA config instead:
@@ -62,7 +60,6 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
             --input_jsonl "${split_jsonl_path}" \
             --tar_output_pattern "${TOKEN_DIR}/${split}/audios/shard-%06d.tar" \
             --jsonl_output_pattern "${TOKEN_DIR}/${split}/txts/shard-%06d.jsonl" \
-            --tokenizer_path "${TOKENIZER_PATH}" \
             --nj_per_gpu 3 \
             --shuffle True
 

@@ -115,8 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tokenizer_path",
         type=str,
-        default="eustlb/higgs-audio-v2-tokenizer",
-        help="Path to audio tokenizer.",
+        default="k2-fsa/OmniVoice",
+        help="HuggingFace repo ID or local path of the audio tokenizer. "
+        "Accepts either a standalone tokenizer repo or the main OmniVoice repo "
+        "(the audio_tokenizer subfolder will be used automatically).",
     )
     parser.add_argument(
         "--skip_errors", action="store_true", help="Skip items that fail to process"
@@ -184,6 +186,29 @@ def serialise_numpy(key: str, tokens: np.ndarray) -> dict:
     return {"__key__": key, "npy": buffer.getvalue()}
 
 
+def _resolve_tokenizer_path(name_or_path: str) -> str:
+    """Resolve the audio tokenizer to a local directory.
+
+    Supports three cases:
+    1. Local path that already points directly at the tokenizer directory.
+    2. Local path that is the root of a downloaded OmniVoice repo containing
+       an ``audio_tokenizer`` subdirectory.
+    3. HuggingFace repo ID (e.g. ``k2-fsa/OmniVoice`` or the legacy
+       ``eustlb/higgs-audio-v2-tokenizer``): the repo is downloaded and,
+       if it contains an ``audio_tokenizer`` subfolder, that subfolder is
+       returned; otherwise the repo root is returned.
+    """
+    if os.path.isdir(name_or_path):
+        sub = os.path.join(name_or_path, "audio_tokenizer")
+        return sub if os.path.isdir(sub) else name_or_path
+
+    from huggingface_hub import snapshot_download
+
+    local_dir = snapshot_download(name_or_path)
+    sub = os.path.join(local_dir, "audio_tokenizer")
+    return sub if os.path.isdir(sub) else local_dir
+
+
 def process_init(rank_queue, tokenizer_path):
     """
     Initialization function for each worker process.
@@ -207,10 +232,15 @@ def process_init(rank_queue, tokenizer_path):
         worker_device = torch.device("cpu")
 
     logging.debug(f"Worker process initialized with device: {worker_device}")
+    # Resolve tokenizer path (handles main-repo subdirectory layout)
+    resolved_tokenizer_path = _resolve_tokenizer_path(tokenizer_path)
+    logging.debug(f"Resolved tokenizer path: {resolved_tokenizer_path}")
     # Load tokenizer onto the specified device
-    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(tokenizer_path)
+    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(
+        resolved_tokenizer_path
+    )
     worker_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-        tokenizer_path, device_map=worker_device
+        resolved_tokenizer_path, device_map=worker_device
     )
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
 

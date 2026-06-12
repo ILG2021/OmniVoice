@@ -26,8 +26,6 @@ MANIFEST_DIR="data/emilia/manifests"
 # Directory to write tokenized WebDataset shards
 TOKEN_DIR="data/emilia/tokens"
 
-# Audio tokenizer model (HuggingFace repo or local path)
-TOKENIZER_PATH="eustlb/higgs-audio-v2-tokenizer"
 
 # Training config file
 TRAIN_CONFIG="config/train_config_emilia.json"
@@ -91,7 +89,6 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
             --input_jsonl "${MANIFEST_DIR}/${split}.jsonl" \
             --tar_output_pattern "${TOKEN_DIR}/${split}/audios/shard-%06d.tar" \
             --jsonl_output_pattern "${TOKEN_DIR}/${split}/txts/shard-%06d.jsonl" \
-            --tokenizer_path "${TOKENIZER_PATH}" \
             --nj_per_gpu 3 \
             --shuffle True
 

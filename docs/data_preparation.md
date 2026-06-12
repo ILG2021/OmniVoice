@@ -29,7 +29,6 @@ python -m omnivoice.scripts.extract_audio_tokens \
     --input_jsonl data.jsonl \
     --tar_output_pattern output/audios/shard-%06d.tar \
     --jsonl_output_pattern output/txts/shard-%06d.jsonl \
-    --tokenizer_path eustlb/higgs-audio-v2-tokenizer \
     --nj_per_gpu 3 \
     --shuffle True
 ```
@@ -51,7 +50,6 @@ python -m omnivoice.scripts.extract_audio_tokens \
     --input_manifest existing_data/data.lst \
     --tar_output_pattern output/audios/shard-%06d.tar \
     --jsonl_output_pattern output/txts/shard-%06d.jsonl \
-    --tokenizer_path eustlb/higgs-audio-v2-tokenizer \
     --nj_per_gpu 3 \
     --shuffle True
 ```
@@ -79,7 +77,7 @@ This resamples audio to the target sample rate and packs FLAC files into tar sha
 | `--input_jsonl` | None | Path to raw JSONL file, mutually exclusive with `--input_manifest` |
 | `--tar_output_pattern` | (required) | Tar shard output pattern, e.g. `output/audios/shard-%06d.tar` |
 | `--jsonl_output_pattern` | (required) | JSONL shard output pattern, e.g. `output/txts/shard-%06d.jsonl` |
-| `--tokenizer_path` | `eustlb/higgs-audio-v2-tokenizer` | HuggingFace tokenizer path or local path |
+| `--tokenizer_path` | `k2-fsa/OmniVoice` | HuggingFace repo or local path; if the repo contains an `audio_tokenizer` subfolder it is used automatically. Can be omitted to use the default. |
 | `--nj_per_gpu` | 3 | Worker processes per GPU |
 | `--loader_workers` | 24 | DataLoader workers for streaming `IterableDataset` |
 | `--shuffle` | True | Shuffle samples before sharding |

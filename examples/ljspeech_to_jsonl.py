@@ -242,8 +242,7 @@ def main():
     print(f"  python -m omnivoice.scripts.extract_audio_tokens \\")
     print(f"      --input_jsonl {output_dir / 'train.jsonl'} \\")
     print(f"      --tar_output_pattern  data/ljspeech/tokens/train/audios/shard-%06d.tar \\")
-    print(f"      --jsonl_output_pattern data/ljspeech/tokens/train/txts/shard-%06d.jsonl \\")
-    print(f"      --tokenizer_path eustlb/higgs-audio-v2-tokenizer")
+    print(f"      --jsonl_output_pattern data/ljspeech/tokens/train/txts/shard-%06d.jsonl")
 
 
 if __name__ == "__main__":
