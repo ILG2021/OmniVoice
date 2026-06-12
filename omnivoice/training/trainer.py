@@ -86,6 +86,15 @@ class OmniTrainer:
                 "train_micro_batch_size_per_gpu"
             ] = 1
 
+        # 3b. Gradient Checkpointing
+        if getattr(self.config, "gradient_checkpointing", False):
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+                # Required so that gradients flow through non-leaf inputs
+                if hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+                logger.info("Gradient checkpointing enabled.")
+
         # 4. Prepare with Accelerator
         (self.model, self.optimizer, self.lr_scheduler,) = self.accelerator.prepare(
             self.model,

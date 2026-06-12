@@ -92,6 +92,7 @@ class TrainingConfig:
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None
+    gradient_checkpointing: bool = False
     attn_implementation: str = field(default_factory=_detect_attn_impl)
 
     # Length-grouped batching (only used when attn_implementation != "flex_attention")
