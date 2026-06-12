@@ -22,7 +22,7 @@ This directory contains scripts and configs for training, fine-tuning, and evalu
 
 **Prerequisites:**
 
-1. Download the Emilia dataset from [OpenXLab](https://openxlab.org.cn/datasets/Amphion/Emilia) and place it under `download/`:
+1. Download the Emilia dataset from [Hugging Face](https://huggingface.co/datasets/amphion/Emilia-Dataset) and place it under `download/`:
    ```
    download/Amphion___Emilia
    └── raw

@@ -74,6 +74,7 @@ torch = [
 torchaudio = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+funasr = { git = "https://github.com/ILG2021/FunASR.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cuda"

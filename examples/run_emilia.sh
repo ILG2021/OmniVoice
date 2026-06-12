@@ -47,8 +47,7 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     echo "Stage 0: Download data"
 
     # You should manually download the Emilia dataset from
-    # https://openxlab.org.cn/datasets/Amphion/Emilia
-    # or https://huggingface.co/datasets/amphion/Emilia-Dataset/tree/fc71e07
+    # https://huggingface.co/datasets/amphion/Emilia-Dataset
     # and place it in the download directory.
     # Your download directory should at least contain the following structure:
     #
@@ -58,7 +57,7 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     #    │   └── ZH
 
     if [ ! -d "$dl_dir"/Amphion___Emilia/raw ]; then
-        echo "Please refer https://openxlab.org.cn/datasets/Amphion/Emilia to download the dataset."
+        echo "Please refer to https://huggingface.co/datasets/amphion/Emilia-Dataset to download the dataset."
         exit 1
     fi
 

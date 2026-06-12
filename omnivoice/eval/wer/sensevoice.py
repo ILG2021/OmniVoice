@@ -116,7 +116,7 @@ def load_sensevoice_model(model_dir, device):
         from funasr import AutoModel
 
         model = AutoModel(
-            model="iic/SenseVoiceSmall",
+            model="FunAudioLLM/SenseVoiceSmall",
             device=str(device),
             disable_update=True,
             disable_pbar=True,
