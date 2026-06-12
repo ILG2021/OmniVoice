@@ -52,6 +52,15 @@ from omnivoice.training.config import TrainingConfig
 logger = logging.getLogger(__name__)
 
 
+def _get_sample_length(s: dict) -> int:
+    """Return the token length of a processed sample.
+
+    Defined at module level (not as a lambda) so it can be pickled by
+    ``multiprocessing.spawn`` on Windows.
+    """
+    return s["length"]
+
+
 def build_model_and_tokenizer(
     config: TrainingConfig,
 ) -> Tuple[OmniVoice, AutoTokenizer]:
@@ -175,7 +184,7 @@ def build_dataloaders(
             max_length=config.max_sample_tokens,
             max_sample=config.max_batch_size,
             processor=processor,
-            length_fn=lambda s: s["length"],
+            length_fn=_get_sample_length,
         )
         collate_fn = PaddingDataCollator(processor, config.batch_tokens)
 

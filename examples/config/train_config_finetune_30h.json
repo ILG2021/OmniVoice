@@ -1,5 +1,4 @@
 {
-    "attn_implementation": "sdpa",
     "llm_name_or_path": "Qwen/Qwen3-0.6B",
     "audio_vocab_size": 1025,
     "audio_mask_id": 1024,

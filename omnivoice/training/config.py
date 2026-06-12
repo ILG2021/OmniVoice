@@ -23,8 +23,24 @@ in ``omnivoice.cli.train``.
 """
 
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
+
+
+def _detect_attn_impl() -> str:
+    """Auto-detect the best available attention implementation.
+
+    Returns ``"flex_attention"`` when Triton is available (Linux / WSL),
+    otherwise falls back to ``"sdpa"`` (PyTorch-native, works everywhere).
+    """
+    if sys.platform == "win32":
+        return "sdpa"
+    try:
+        import triton  # noqa: F401
+        return "flex_attention"
+    except Exception:
+        return "sdpa"
 
 
 @dataclass
@@ -76,7 +92,7 @@ class TrainingConfig:
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None
-    attn_implementation: str = "flex_attention"
+    attn_implementation: str = field(default_factory=_detect_attn_impl)
 
     # Length-grouped batching (only used when attn_implementation != "flex_attention")
     max_sample_tokens: int = 2000
