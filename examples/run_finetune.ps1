@@ -25,9 +25,9 @@ $TOKEN_DIR = "data/finetune/tokens"
 
 
 # Training config file
-# train_config_finetune_30h.json  – tuned for ~30h datasets (30k steps, recommended)
-# train_config_finetune.json      – original 5k-step config (small datasets / quick tests)
-# train_config_finetune_sdpa.json – use this if flex_attention fails on your GPU
+# train_config_finetune_30h.json  - tuned for ~30h datasets (30k steps, recommended)
+# train_config_finetune.json      - original 5k-step config (small datasets / quick tests)
+# train_config_finetune_sdpa.json - use this if flex_attention fails on your GPU
 $TRAIN_CONFIG = "config/train_config_finetune_30h.json"
 
 # Data config file
@@ -69,7 +69,7 @@ if ($stage -le 0 -and $stop_stage -ge 0) {
         $manifest        = "$TOKEN_DIR/$split_name/data.lst"
 
         if (Test-Path $manifest) {
-            Write-Host "  Skipping $split_name – $manifest already exists."
+            Write-Host "  Skipping $split_name - $manifest already exists."
             continue
         }
 

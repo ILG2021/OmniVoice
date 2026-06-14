@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -80,6 +81,32 @@ from omnivoice.utils.voice_design import (
 )
 
 logger = logging.getLogger(__name__)
+
+_AUDIO_TOKENIZER_CACHE_LOCK = threading.Lock()
+_AUDIO_TOKENIZER_CACHE: dict[tuple[str, str], tuple[Any, Any, int, threading.Lock]] = {}
+
+
+def _get_shared_audio_tokenizer(device):
+    audio_tokenizer_path = os.path.join(
+        _resolve_model_path("k2-fsa/OmniVoice"), "audio_tokenizer"
+    )
+    cache_key = (
+        os.path.normcase(os.path.realpath(os.path.abspath(audio_tokenizer_path))),
+        str(device),
+    )
+    with _AUDIO_TOKENIZER_CACHE_LOCK:
+        cached = _AUDIO_TOKENIZER_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+            audio_tokenizer_path, device_map=device
+        )
+        feature_extractor = AutoFeatureExtractor.from_pretrained(audio_tokenizer_path)
+        sampling_rate = feature_extractor.sampling_rate
+        cached = (audio_tokenizer, feature_extractor, sampling_rate, threading.Lock())
+        _AUDIO_TOKENIZER_CACHE[cache_key] = cached
+        return cached
 
 
 # ---------------------------------------------------------------------------
@@ -255,12 +282,18 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._asr_lock = threading.Lock()
+        self._audio_tokenizer_lock = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
+        asr_model_name = kwargs.pop(
+            "asr_model_name",
+            "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14",
+        )
+        asr_num_threads = kwargs.pop("asr_num_threads", 1)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
@@ -275,31 +308,29 @@ class OmniVoice(PreTrainedModel):
             if not train_mode:
                 model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
-                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
-
-                if not os.path.isdir(audio_tokenizer_path):
-                    audio_tokenizer_path = os.path.join(
-                        _resolve_model_path("k2-fsa/OmniVoice"), "audio_tokenizer"
-                    )
-
                 # higgs-audio-v2-tokenizer does not support MPS
                 # (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
-
-                model.sampling_rate = model.feature_extractor.sampling_rate
+                (
+                    audio_tokenizer,
+                    feature_extractor,
+                    sampling_rate,
+                    audio_tokenizer_lock,
+                ) = _get_shared_audio_tokenizer(tokenizer_device)
+                object.__setattr__(model, "audio_tokenizer", audio_tokenizer)
+                object.__setattr__(model, "feature_extractor", feature_extractor)
+                model.sampling_rate = sampling_rate
+                model._audio_tokenizer_lock = audio_tokenizer_lock
 
                 model.duration_estimator = RuleDurationEstimator()
 
                 if load_asr:
-                    model.load_asr_model(model_name=asr_model_name)
+                    model.load_asr_model(
+                        model_name=asr_model_name,
+                        num_threads=asr_num_threads,
+                    )
         finally:
             logging.disable(_prev_disable)
 
@@ -309,28 +340,31 @@ class OmniVoice(PreTrainedModel):
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
 
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
-        """Load a Whisper ASR model for reference audio transcription.
+    def load_asr_model(
+        self,
+        model_name: str = "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14",
+        num_threads: int = 1,
+    ):
+        """Load a sherpa-onnx ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace model name or local path for the Whisper model.
+            model_name: HuggingFace repo id, local model directory, or a paraformer
+                ONNX model file path.
+            num_threads: Number of CPU threads used by sherpa-onnx.
         """
-        from transformers import pipeline as hf_pipeline
+        from omnivoice.utils.sherpa_asr import (
+            SherpaAsrConfig,
+            create_offline_recognizer,
+        )
 
         logger.info("Loading ASR model %s ...", model_name)
-        asr_dtype = (
-            torch.float16 if str(self.device).startswith(("cuda", "xpu")) else torch.float32
+        self._asr_pipe = create_offline_recognizer(
+            SherpaAsrConfig(
+                model=model_name,
+                num_threads=max(1, int(num_threads)),
+            )
         )
-
-        model_name = _resolve_model_path(model_name)
-
-        self._asr_pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model=model_name,
-            dtype=asr_dtype,
-            device_map=self.device,
-        )
-        logger.info("ASR model loaded on %s.", self.device)
+        logger.info("ASR model loaded with sherpa-onnx.")
 
     @torch.inference_mode()
     def transcribe(
@@ -351,6 +385,11 @@ class OmniVoice(PreTrainedModel):
             raise RuntimeError(
                 "ASR model is not loaded. Call model.load_asr_model() first."
             )
+
+        from omnivoice.utils.sherpa_asr import transcribe
+
+        with self._asr_lock:
+            return transcribe(self._asr_pipe, audio)
 
         if isinstance(audio, str):
             return self._asr_pipe(audio)["text"].strip()
@@ -706,11 +745,12 @@ class OmniVoice(PreTrainedModel):
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
         # numpy → torch at tokenizer boundary
         ref_wav_tensor = torch.from_numpy(ref_wav).to(self.audio_tokenizer.device)
-        ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav_tensor.unsqueeze(0),
-        ).audio_codes.squeeze(
-            0
-        )  # (C, T)
+        with self._audio_tokenizer_lock:
+            ref_audio_tokens = self.audio_tokenizer.encode(
+                ref_wav_tensor.unsqueeze(0),
+            ).audio_codes.squeeze(
+                0
+            )  # (C, T)
 
         if preprocess_prompt:
             ref_text = add_punctuation(ref_text)
@@ -737,22 +777,25 @@ class OmniVoice(PreTrainedModel):
             Decoded and post-processed audio array of shape (T,).
         """
         tokenizer_device = self.audio_tokenizer.device
-        if isinstance(tokens, list):
-            chunk_audios = [
-                self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
-                .audio_values[0]
-                .cpu()
-                .numpy()
-                for t in tokens
-            ]
-            audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
-        else:
-            audio_waveform = (
-                self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
-                .audio_values[0]
-                .cpu()
-                .numpy()
-            )
+        with self._audio_tokenizer_lock:
+            if isinstance(tokens, list):
+                chunk_audios = [
+                    self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
+                    .audio_values[0]
+                    .cpu()
+                    .numpy()
+                    for t in tokens
+                ]
+                audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+            else:
+                audio_waveform = (
+                    self.audio_tokenizer.decode(
+                        tokens.to(tokenizer_device).unsqueeze(0)
+                    )
+                    .audio_values[0]
+                    .cpu()
+                    .numpy()
+                )
 
         audio_waveform = self._post_process_audio(
             audio_waveform,

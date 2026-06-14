@@ -41,6 +41,7 @@ dependencies = [
     "numpy",
     "soundfile",
     "librosa",
+    "sherpa-onnx>=1.13.2",
 ]
 
 [project.optional-dependencies]
