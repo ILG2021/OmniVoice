@@ -612,6 +612,7 @@ def build_demo(
                             type="filepath",
                             autoplay=True,
                             interactive=True,
+                            sources=[],
                         )
                         vc_btn = gr.Button("生成", variant="primary")
                         vc_status = gr.Textbox(label="状态", lines=2)
@@ -710,6 +711,7 @@ def build_demo(
                             type="filepath",
                             autoplay=True,
                             interactive=True,
+                            sources=[],
                         )
                         vd_btn = gr.Button("生成", variant="primary")
                         vd_status = gr.Textbox(label="状态", lines=2)
