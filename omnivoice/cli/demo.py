@@ -658,6 +658,7 @@ def build_demo(
                             autoplay=True,
                             interactive=True,
                             sources=[],
+                            buttons=["download"],
                         )
                         vc_btn = gr.Button("生成", variant="primary")
                         vc_save_btn = gr.Button("保存裁剪结果")
@@ -770,6 +771,7 @@ def build_demo(
                             autoplay=True,
                             interactive=True,
                             sources=[],
+                            buttons=["download"],
                         )
                         vd_btn = gr.Button("生成", variant="primary")
                         vd_save_btn = gr.Button("保存裁剪结果")
