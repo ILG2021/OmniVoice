@@ -400,9 +400,9 @@ def build_demo(
     ):
         model_id = model_choices.get(model_name)
         if model_id is None:
-            return None, f"未知模型：{model_name}"
+            return None, f"未知模型：{model_name}", None
         if not text or not text.strip():
-            return None, "请输入要合成的文本。"
+            return None, "请输入要合成的文本。", None
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
@@ -424,7 +424,7 @@ def build_demo(
             kw["duration"] = float(duration)
 
         if mode == "clone" and not ref_audio:
-            return None, "请上传参考音频。"
+            return None, "请上传参考音频。", None
 
         acquired = False
         try:
@@ -442,7 +442,7 @@ def build_demo(
 
                 audio = model.generate(**kw)
         except Exception as e:
-            return None, f"错误：{type(e).__name__}: {e}"
+            return None, f"错误：{type(e).__name__}: {e}", None
         finally:
             if acquired:
                 model_cache.release(model_id)
@@ -475,7 +475,40 @@ def build_demo(
         )
         output_path = os.path.join(last_audio_path, filename)
         sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
-        return output_path, "完成。"
+        return output_path, "完成。", output_path
+
+    def _save_edited_audio(audio_path, target_path):
+        if not audio_path:
+            return None, "没有可保存的音频。", target_path
+
+        if not target_path:
+            target_path = os.path.join("last_audio", "edited_audio.wav")
+
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+
+        try:
+            data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+            if sample_rate != 48000:
+                audio_tensor = torch.from_numpy(np.asarray(data, dtype=np.float32))
+                if audio_tensor.ndim == 1:
+                    audio_tensor = audio_tensor.unsqueeze(0)
+                else:
+                    audio_tensor = audio_tensor.T
+                data = (
+                    torchaudio.functional.resample(
+                        audio_tensor,
+                        orig_freq=sample_rate,
+                        new_freq=48000,
+                    )
+                    .T.squeeze()
+                    .numpy()
+                )
+                sample_rate = 48000
+            sf.write(target_path, data, sample_rate, subtype="PCM_32")
+        except Exception as e:
+            return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path
+
+        return target_path, f"已保存裁剪结果：{os.path.basename(target_path)}", target_path
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -553,13 +586,7 @@ def build_demo(
         return ns, gs, dn, sp, du, pp, po
 
     with gr.Blocks(theme=theme, css=css, title="OmniVoice 演示") as demo:
-        gr.Markdown(
-            """
-# OmniVoice 演示
-
-支持声音克隆和声音设计，可用于多语言文本转语音生成。
-"""
-        )
+        
         model_select = gr.Dropdown(
             label="模型",
             choices=list(model_choices.keys()),
@@ -607,6 +634,7 @@ def build_demo(
                             vc_po,
                         ) = _gen_settings()
                     with gr.Column(scale=1):
+                        vc_audio_path = gr.State(value=None)
                         vc_audio = gr.Audio(
                             label="合成结果",
                             type="filepath",
@@ -615,6 +643,7 @@ def build_demo(
                             sources=[],
                         )
                         vc_btn = gr.Button("生成", variant="primary")
+                        vc_save_btn = gr.Button("保存裁剪结果")
                         vc_status = gr.Textbox(label="状态", lines=2)
 
                 def _clone_fn(
@@ -666,9 +695,14 @@ def build_demo(
                         vc_pp,
                         vc_po,
                     ],
-                    outputs=[vc_audio, vc_status],
+                    outputs=[vc_audio, vc_status, vc_audio_path],
                     concurrency_id="gpu_infer",
                     concurrency_limit=concurrency_limit,
+                )
+                vc_save_btn.click(
+                    _save_edited_audio,
+                    inputs=[vc_audio, vc_audio_path],
+                    outputs=[vc_audio, vc_status, vc_audio_path],
                 )
 
             # ==============================================================
@@ -706,6 +740,7 @@ def build_demo(
                             vd_po,
                         ) = _gen_settings()
                     with gr.Column(scale=1):
+                        vd_audio_path = gr.State(value=None)
                         vd_audio = gr.Audio(
                             label="合成结果",
                             type="filepath",
@@ -714,6 +749,7 @@ def build_demo(
                             sources=[],
                         )
                         vd_btn = gr.Button("生成", variant="primary")
+                        vd_save_btn = gr.Button("保存裁剪结果")
                         vd_status = gr.Textbox(label="状态", lines=2)
 
                 def _build_instruct(groups):
@@ -772,9 +808,14 @@ def build_demo(
                         vd_po,
                     ]
                     + vd_groups,
-                    outputs=[vd_audio, vd_status],
+                    outputs=[vd_audio, vd_status, vd_audio_path],
                     concurrency_id="gpu_infer",
                     concurrency_limit=concurrency_limit,
+                )
+                vd_save_btn.click(
+                    _save_edited_audio,
+                    inputs=[vd_audio, vd_audio_path],
+                    outputs=[vd_audio, vd_status, vd_audio_path],
                 )
 
     return demo
