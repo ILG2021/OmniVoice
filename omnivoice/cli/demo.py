@@ -479,7 +479,7 @@ def build_demo(
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
-            return None, "没有可保存的音频。", target_path
+            return None, "没有可保存的音频。", target_path, None
 
         if not target_path:
             target_path = os.path.join("last_audio", "edited_audio.wav")
@@ -506,9 +506,14 @@ def build_demo(
                 sample_rate = 48000
             sf.write(target_path, data, sample_rate, subtype="PCM_32")
         except Exception as e:
-            return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path
+            return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path, None
 
-        return target_path, f"已保存裁剪结果：{os.path.basename(target_path)}", target_path
+        return (
+            target_path,
+            f"已保存裁剪结果：{os.path.basename(target_path)}",
+            target_path,
+            target_path,
+        )
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -525,6 +530,18 @@ def build_demo(
     .gradio-container .prose {font-size: 1.1em !important;}
     .compact-audio audio {height: 60px !important;}
     .compact-audio .waveform {min-height: 80px !important;}
+    #vc_download_file, #vd_download_file {display: none !important;}
+    """
+
+    auto_download_js = """
+    () => {
+        setTimeout(() => {
+            const links = document.querySelectorAll('#vc_download_file a[href], #vd_download_file a[href]');
+            const link = links[links.length - 1];
+            if (link) link.click();
+        }, 500);
+        return [];
+    }
     """
 
     def _lang_dropdown(label="语言（可选）", value=_AUTO_LABEL):
@@ -644,6 +661,11 @@ def build_demo(
                         )
                         vc_btn = gr.Button("生成", variant="primary")
                         vc_save_btn = gr.Button("保存裁剪结果")
+                        vc_download_file = gr.File(
+                            label="下载文件",
+                            elem_id="vc_download_file",
+                            show_label=False,
+                        )
                         vc_status = gr.Textbox(label="状态", lines=2)
 
                 def _clone_fn(
@@ -699,11 +721,12 @@ def build_demo(
                     concurrency_id="gpu_infer",
                     concurrency_limit=concurrency_limit,
                 )
-                vc_save_btn.click(
+                vc_save_event = vc_save_btn.click(
                     _save_edited_audio,
                     inputs=[vc_audio, vc_audio_path],
-                    outputs=[vc_audio, vc_status, vc_audio_path],
+                    outputs=[vc_audio, vc_status, vc_audio_path, vc_download_file],
                 )
+                vc_save_event.then(fn=None, js=auto_download_js, queue=False)
 
             # ==============================================================
             # Voice Design
@@ -750,6 +773,11 @@ def build_demo(
                         )
                         vd_btn = gr.Button("生成", variant="primary")
                         vd_save_btn = gr.Button("保存裁剪结果")
+                        vd_download_file = gr.File(
+                            label="下载文件",
+                            elem_id="vd_download_file",
+                            show_label=False,
+                        )
                         vd_status = gr.Textbox(label="状态", lines=2)
 
                 def _build_instruct(groups):
@@ -812,11 +840,12 @@ def build_demo(
                     concurrency_id="gpu_infer",
                     concurrency_limit=concurrency_limit,
                 )
-                vd_save_btn.click(
+                vd_save_event = vd_save_btn.click(
                     _save_edited_audio,
                     inputs=[vd_audio, vd_audio_path],
-                    outputs=[vd_audio, vd_status, vd_audio_path],
+                    outputs=[vd_audio, vd_status, vd_audio_path, vd_download_file],
                 )
+                vd_save_event.then(fn=None, js=auto_download_js, queue=False)
 
     return demo
 
