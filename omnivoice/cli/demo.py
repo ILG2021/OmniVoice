@@ -327,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, default=7860, help="Server port (default: 7860)."
     )
     parser.add_argument(
-        "--root-path",
+        "--root_path",
         default=None,
         help="Root path for reverse proxy.",
     )
