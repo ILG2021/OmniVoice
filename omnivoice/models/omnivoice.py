@@ -82,6 +82,9 @@ from omnivoice.utils.voice_design import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SHERPA_ASR_MODEL = "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14"
+DEFAULT_WHISPER_ASR_MODEL = "openai/whisper-large-v3-turbo"
+
 _AUDIO_TOKENIZER_CACHE_LOCK = threading.Lock()
 _AUDIO_TOKENIZER_CACHE: dict[tuple[str, str], tuple[Any, Any, int, threading.Lock]] = {}
 
@@ -282,6 +285,8 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._asr_backend = None
+        self._asr_language = None
         self._asr_lock = threading.Lock()
         self._audio_tokenizer_lock = None
 
@@ -289,10 +294,9 @@ class OmniVoice(PreTrainedModel):
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop(
-            "asr_model_name",
-            "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14",
-        )
+        asr_backend = kwargs.pop("asr_backend", "sherpa")
+        asr_model_name = kwargs.pop("asr_model_name", None)
+        asr_language = kwargs.pop("asr_language", None)
         asr_num_threads = kwargs.pop("asr_num_threads", 1)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
@@ -329,6 +333,8 @@ class OmniVoice(PreTrainedModel):
                 if load_asr:
                     model.load_asr_model(
                         model_name=asr_model_name,
+                        backend=asr_backend,
+                        language=asr_language,
                         num_threads=asr_num_threads,
                     )
         finally:
@@ -342,67 +348,104 @@ class OmniVoice(PreTrainedModel):
 
     def load_asr_model(
         self,
-        model_name: str = "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14",
+        model_name: Optional[str] = None,
+        backend: str = "sherpa",
+        language: Optional[str] = None,
         num_threads: int = 1,
     ):
-        """Load a sherpa-onnx ASR model for reference audio transcription.
+        """Load an ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace repo id, local model directory, or a paraformer
-                ONNX model file path.
+            model_name: ASR model path or HuggingFace repo id.
+            backend: "sherpa" for sherpa-onnx or "whisper" for Transformers Whisper.
+            language: Optional Whisper language hint. Leave None for auto-detect.
             num_threads: Number of CPU threads used by sherpa-onnx.
         """
-        from omnivoice.utils.sherpa_asr import (
-            SherpaAsrConfig,
-            create_offline_recognizer,
-        )
+        backend = backend.lower().strip()
+        self._asr_backend = backend
+        self._asr_language = language
 
-        logger.info("Loading ASR model %s ...", model_name)
-        self._asr_pipe = create_offline_recognizer(
-            SherpaAsrConfig(
-                model=model_name,
-                num_threads=max(1, int(num_threads)),
+        if backend == "sherpa":
+            from omnivoice.utils.sherpa_asr import (
+                SherpaAsrConfig,
+                create_offline_recognizer,
             )
+
+            model_name = model_name or DEFAULT_SHERPA_ASR_MODEL
+            logger.info("Loading sherpa-onnx ASR model %s ...", model_name)
+            self._asr_pipe = create_offline_recognizer(
+                SherpaAsrConfig(
+                    model=model_name,
+                    num_threads=max(1, int(num_threads)),
+                )
+            )
+            logger.info("ASR model loaded with sherpa-onnx.")
+            return
+
+        if backend == "whisper":
+            from transformers import pipeline as hf_pipeline
+
+            model_name = model_name or DEFAULT_WHISPER_ASR_MODEL
+            logger.info("Loading Whisper ASR model %s ...", model_name)
+            asr_dtype = (
+                torch.float16
+                if str(self.device).startswith(("cuda", "xpu"))
+                else torch.float32
+            )
+            model_name = _resolve_model_path(model_name)
+            self._asr_pipe = hf_pipeline(
+                "automatic-speech-recognition",
+                model=model_name,
+                dtype=asr_dtype,
+                device_map=self.device,
+            )
+            logger.info("ASR model loaded with Whisper on %s.", self.device)
+            return
+
+        raise ValueError(
+            "Unsupported ASR backend: %s. Use 'sherpa' or 'whisper'." % backend
         )
-        logger.info("ASR model loaded with sherpa-onnx.")
 
     @torch.inference_mode()
     def transcribe(
         self,
         audio: Union[str, tuple],
     ) -> str:
-        """Transcribe audio using the loaded Whisper ASR model.
-
-        Args:
-            audio: File path or ``(waveform, sample_rate)`` tuple.
-                Waveform can be a numpy array or torch.Tensor of shape
-                ``(1, T)`` or ``(T,)``.
-
-        Returns:
-            Transcribed text.
-        """
+        """Transcribe audio using the loaded ASR model."""
         if self._asr_pipe is None:
             raise RuntimeError(
                 "ASR model is not loaded. Call model.load_asr_model() first."
             )
 
-        from omnivoice.utils.sherpa_asr import transcribe
-
         with self._asr_lock:
-            return transcribe(self._asr_pipe, audio)
+            if self._asr_backend == "sherpa":
+                from omnivoice.utils.sherpa_asr import transcribe
 
-        if isinstance(audio, str):
-            return self._asr_pipe(audio)["text"].strip()
-        else:
-            waveform, sr = audio
-            if isinstance(waveform, torch.Tensor):
-                waveform = waveform.cpu().numpy()
-            waveform = np.squeeze(waveform)  # (1, T) or (T,) → (T,)
-            audio_input = {
-                "array": waveform,
-                "sampling_rate": sr,
-            }
-            return self._asr_pipe(audio_input)["text"].strip()
+                return transcribe(self._asr_pipe, audio)
+
+            if self._asr_backend == "whisper":
+                generate_kwargs = {"task": "transcribe"}
+                if self._asr_language:
+                    generate_kwargs["language"] = self._asr_language
+
+                if isinstance(audio, str):
+                    return self._asr_pipe(
+                        audio, generate_kwargs=generate_kwargs
+                    )["text"].strip()
+
+                waveform, sr = audio
+                if isinstance(waveform, torch.Tensor):
+                    waveform = waveform.cpu().numpy()
+                waveform = np.squeeze(waveform)
+                audio_input = {
+                    "array": waveform,
+                    "sampling_rate": sr,
+                }
+                return self._asr_pipe(
+                    audio_input, generate_kwargs=generate_kwargs
+                )["text"].strip()
+
+        raise RuntimeError("ASR backend is not initialized correctly.")
 
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()

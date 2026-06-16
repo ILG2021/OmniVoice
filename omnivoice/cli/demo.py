@@ -338,14 +338,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-asr",
         action="store_true",
         default=False,
-        help="Skip loading sherpa-onnx ASR model. Reference text auto-transcription"
+        help="Skip loading ASR model. Reference text auto-transcription"
         " will be unavailable.",
     )
     parser.add_argument(
+        "--asr-backend",
+        choices=["sherpa", "whisper"],
+        default="sherpa",
+        help="ASR backend for reference audio transcription (default: sherpa).",
+    )
+    parser.add_argument(
         "--asr-model",
-        default="csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14",
-        help="sherpa-onnx paraformer ONNX path, model directory, or HuggingFace repo id"
-        " (default: csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14).",
+        default=None,
+        help=(
+            "ASR model path or HuggingFace repo id. Defaults to "
+            "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14 for sherpa, "
+            "or openai/whisper-large-v3-turbo for whisper."
+        ),
+    )
+    parser.add_argument(
+        "--asr-language",
+        default=None,
+        help="Optional Whisper language hint, e.g. en, ja, fr. Leave empty for auto-detect.",
     )
     parser.add_argument(
         "--asr-threads",
@@ -882,7 +896,9 @@ def main(argv=None) -> int:
             device_map=device,
             dtype=torch.float16,
             load_asr=not args.no_asr,
+            asr_backend=args.asr_backend,
             asr_model_name=args.asr_model,
+            asr_language=args.asr_language,
             asr_num_threads=args.asr_threads,
         )
         model.eval()
