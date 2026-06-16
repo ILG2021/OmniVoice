@@ -286,7 +286,6 @@ class OmniVoice(PreTrainedModel):
         self.sampling_rate = None
         self._asr_pipe = None
         self._asr_backend = None
-        self._asr_language = None
         self._asr_lock = threading.Lock()
         self._audio_tokenizer_lock = None
 
@@ -296,7 +295,6 @@ class OmniVoice(PreTrainedModel):
         load_asr = kwargs.pop("load_asr", False)
         asr_backend = kwargs.pop("asr_backend", "sherpa")
         asr_model_name = kwargs.pop("asr_model_name", None)
-        asr_language = kwargs.pop("asr_language", None)
         asr_num_threads = kwargs.pop("asr_num_threads", 1)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
@@ -334,7 +332,6 @@ class OmniVoice(PreTrainedModel):
                     model.load_asr_model(
                         model_name=asr_model_name,
                         backend=asr_backend,
-                        language=asr_language,
                         num_threads=asr_num_threads,
                     )
         finally:
@@ -350,7 +347,6 @@ class OmniVoice(PreTrainedModel):
         self,
         model_name: Optional[str] = None,
         backend: str = "sherpa",
-        language: Optional[str] = None,
         num_threads: int = 1,
     ):
         """Load an ASR model for reference audio transcription.
@@ -358,12 +354,10 @@ class OmniVoice(PreTrainedModel):
         Args:
             model_name: ASR model path or HuggingFace repo id.
             backend: "sherpa" for sherpa-onnx or "whisper" for Transformers Whisper.
-            language: Optional Whisper language hint. Leave None for auto-detect.
             num_threads: Number of CPU threads used by sherpa-onnx.
         """
         backend = backend.lower().strip()
         self._asr_backend = backend
-        self._asr_language = language
 
         if backend == "sherpa":
             from omnivoice.utils.sherpa_asr import (
@@ -425,8 +419,6 @@ class OmniVoice(PreTrainedModel):
 
             if self._asr_backend == "whisper":
                 generate_kwargs = {"task": "transcribe"}
-                if self._asr_language:
-                    generate_kwargs["language"] = self._asr_language
 
                 if isinstance(audio, str):
                     return self._asr_pipe(

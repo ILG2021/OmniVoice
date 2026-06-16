@@ -357,11 +357,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--asr-language",
-        default=None,
-        help="Optional Whisper language hint, e.g. en, ja, fr. Leave empty for auto-detect.",
-    )
-    parser.add_argument(
         "--asr-threads",
         type=int,
         default=8,
@@ -528,6 +523,32 @@ def build_demo(
             target_path,
             target_path,
         )
+
+    def _transcribe_ref_audio(model_name, ref_audio):
+        if not ref_audio:
+            return gr.update(), "请上传参考音频。"
+
+        model_id = model_choices.get(model_name)
+        if model_id is None:
+            return gr.update(), f"未知模型：{model_name}"
+
+        acquired = False
+        try:
+            with infer_semaphore, torch.inference_mode():
+                model = model_cache.acquire(model_id)
+                acquired = True
+                text = model.transcribe(ref_audio).strip()
+        except Exception as e:
+            return gr.update(), f"转录失败：{type(e).__name__}: {e}"
+        finally:
+            if acquired:
+                model_cache.release(model_id)
+            _cleanup_torch_cache(model_cache.device)
+
+        if not text:
+            return gr.update(value=""), "转录完成，但未识别到文本。"
+
+        return gr.update(value=text), "参考音频已转录，可直接修改参考文本。"
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -736,6 +757,13 @@ def build_demo(
                     concurrency_id="gpu_infer",
                     concurrency_limit=concurrency_limit,
                 )
+                vc_ref_audio.upload(
+                    _transcribe_ref_audio,
+                    inputs=[model_select, vc_ref_audio],
+                    outputs=[vc_ref_text, vc_status],
+                    concurrency_id="gpu_infer",
+                    concurrency_limit=concurrency_limit,
+                )
                 vc_save_event = vc_save_btn.click(
                     _save_edited_audio,
                     inputs=[vc_audio, vc_audio_path],
@@ -898,7 +926,6 @@ def main(argv=None) -> int:
             load_asr=not args.no_asr,
             asr_backend=args.asr_backend,
             asr_model_name=args.asr_model,
-            asr_language=args.asr_language,
             asr_num_threads=args.asr_threads,
         )
         model.eval()
