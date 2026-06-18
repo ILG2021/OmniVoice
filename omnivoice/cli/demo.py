@@ -28,6 +28,7 @@ import collections
 import gc
 import logging
 import os
+import secrets
 import threading
 from typing import Any, Callable, Dict
 
@@ -40,7 +41,7 @@ import torchaudio
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
-
+from omnivoice.utils import asr_sherpaonnx
 
 # ---------------------------------------------------------------------------
 # Language list — all 600+ supported languages
@@ -322,12 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device", default=None, help="Device to use. Auto-detected if not specified."
     )
-    parser.add_argument("--ip", default="0.0.0.0", help="Server IP (default: 0.0.0.0).")
+    parser.add_argument("--ip", default="127.0.0.1", help="Server IP (default: 0.0.0.0).")
     parser.add_argument(
         "--port", type=int, default=7860, help="Server port (default: 7860)."
     )
     parser.add_argument(
-        "--root_path",
+        "--root-path",
         default=None,
         help="Root path for reverse proxy.",
     )
@@ -404,14 +405,25 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
-        mode,
+        use_random_seed,
+        seed,
         ref_text=None,
     ):
+        if use_random_seed:
+            seed_val = secrets.randbelow(2**31)
+        else:
+            try:
+                seed_val = int(seed)
+                if seed_val < 0:
+                    seed_val = secrets.randbelow(2**31)
+            except (TypeError, ValueError):
+                seed_val = secrets.randbelow(2**31)
+
         model_id = model_choices.get(model_name)
         if model_id is None:
-            return None, f"未知模型：{model_name}", None
+            return None, f"未知模型：{model_name}", None, seed_val
         if not text or not text.strip():
-            return None, "请输入要合成的文本。", None
+            return None, "请输入要合成的文本。", None, seed_val
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
@@ -419,6 +431,7 @@ def build_demo(
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
+            seed=seed_val,
         )
 
         lang = language if (language and language != _AUTO_LABEL) else None
@@ -432,18 +445,16 @@ def build_demo(
         if duration is not None and float(duration) > 0:
             kw["duration"] = float(duration)
 
-        if mode == "clone" and not ref_audio:
-            return None, "请上传参考音频。", None
-
         acquired = False
         try:
             with infer_semaphore, torch.inference_mode():
                 model = model_cache.acquire(model_id)
                 acquired = True
-                if mode == "clone":
+                if ref_audio:
                     kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
                         ref_audio=ref_audio,
                         ref_text=ref_text,
+                        preprocess_prompt=preprocess_prompt,
                     )
 
                 if instruct and instruct.strip():
@@ -451,7 +462,7 @@ def build_demo(
 
                 audio = model.generate(**kw)
         except Exception as e:
-            return None, f"错误：{type(e).__name__}: {e}", None
+            return None, f"错误：{type(e).__name__}: {e}", None, seed_val
         finally:
             if acquired:
                 model_cache.release(model_id)
@@ -472,19 +483,21 @@ def build_demo(
         waveform = waveform_float.clip(-1.0, 1.0).astype(np.float32)
         last_audio_path = "last_audio"
         os.makedirs(last_audio_path, exist_ok=True)
-        if mode == "clone" and ref_audio:
+        if ref_audio:
             ref_basename = os.path.basename(ref_audio).rpartition(".")[0]
-        else:
+        elif instruct and instruct.strip():
             ref_basename = "voice_design"
+        else:
+            ref_basename = "auto"
         speed_label = speed if speed is not None else 1.0
         filename = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}-orgi_audio.wav"
+            f"spd{speed_label}--seed{seed_val}--last_audio.wav"
         )
         output_path = os.path.join(last_audio_path, filename)
         sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
-        return output_path, "完成。", output_path
+        return output_path, "完成。", output_path, seed_val
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
@@ -519,36 +532,29 @@ def build_demo(
 
         return (
             target_path,
-            f"已保存裁剪结果：{os.path.basename(target_path)}",
+            f"已保存：{os.path.basename(target_path)}",
             target_path,
             target_path,
         )
 
-    def _transcribe_ref_audio(model_name, ref_audio):
-        if not ref_audio:
+    def _transcribe_ref_audio(audio_path):
+        """转录前先检测音频时长，超过限制直接返回提示，避免长音频占用转录队列"""
+        MAX_REF_AUDIO_DURATION = 15
+        if not audio_path or not os.path.exists(audio_path):
             return gr.update(), "请上传参考音频。"
-
-        model_id = model_choices.get(model_name)
-        if model_id is None:
-            return gr.update(), f"未知模型：{model_name}"
-
-        acquired = False
         try:
-            with infer_semaphore, torch.inference_mode():
-                model = model_cache.acquire(model_id)
-                acquired = True
-                text = model.transcribe(ref_audio).strip()
+            info = sf.info(audio_path)
+            if info.duration > MAX_REF_AUDIO_DURATION:
+                gr.Warning(f"参考音频过长（{info.duration:.1f}s），请上传 {MAX_REF_AUDIO_DURATION}s 以内的音频")
+                return gr.update(value=""), "你输入的音频过长"
         except Exception as e:
-            return gr.update(), f"转录失败：{type(e).__name__}: {e}"
-        finally:
-            if acquired:
-                model_cache.release(model_id)
-            _cleanup_torch_cache(model_cache.device)
-
-        if not text:
-            return gr.update(value=""), "转录完成，但未识别到文本。"
-
-        return gr.update(value=text), "参考音频已转录，可直接修改参考文本。"
+            return gr.update(), f"读取音频时长失败: {e}"
+            
+        try:
+            text = asr_sherpaonnx.transcribe(audio_path)
+            return gr.update(value=text), "参考音频已转录，可直接修改参考文本。"
+        except Exception as e:
+            return gr.update(), f"转录失败：{e}"
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -565,7 +571,7 @@ def build_demo(
     .gradio-container .prose {font-size: 1.1em !important;}
     .compact-audio audio {height: 60px !important;}
     .compact-audio .waveform {min-height: 80px !important;}
-    #vc_download_file, #vd_download_file {display: none !important;}
+    #vc_download_file {display: none !important;}
     """
 
     auto_download_js = """
@@ -579,265 +585,97 @@ def build_demo(
     }
     """
 
-    def _lang_dropdown(label="语言（可选）", value=_AUTO_LABEL):
+    def _lang_dropdown(label="语言（可选）", value="Chinese"):
         return gr.Dropdown(
             label=label,
             choices=_ALL_LANGUAGES,
             value=value,
             allow_custom_value=False,
             interactive=True,
-            info="保持为自动时由模型自行判断语言。",
         )
 
-    def _gen_settings():
-        with gr.Accordion("生成设置（可选）", open=False):
-            sp = gr.Slider(
-                0.5,
-                1.5,
-                value=1.0,
-                step=0.05,
-                label="语速",
-                info="1.0 为正常语速，大于 1 更快，小于 1 更慢。设置固定时长后将忽略此项。",
+    with gr.Blocks(theme=theme,analytics_enabled=False, css=css) as demo:
+        with gr.Row():
+            target_lang = _lang_dropdown()
+            model_select = gr.Dropdown(
+                label="模型",
+                choices=list(model_choices.keys()),
+                value=default_model_name,
+                interactive=True,
             )
-            du = gr.Number(
-                value=None,
-                label="固定时长（秒）",
-                info="留空则使用语速控制。填写固定时长后会覆盖语速设置。",
+        with gr.Row(equal_height=True):
+            target_text = gr.Textbox(
+                label="生成文本",
+                lines=4,
+                placeholder="请输入要合成的文本...",
             )
-            ns = gr.Slider(
-                4,
-                64,
-                value=32,
-                step=1,
-                label="推理步数",
-                info="默认 32。数值越低速度越快，数值越高质量通常更好。",
-            )
-            dn = gr.Checkbox(
-                label="降噪",
-                value=True,
-                info="默认开启。取消勾选可关闭降噪。",
-            )
-            gs = gr.Slider(
-                0.0,
-                4.0,
-                value=2.0,
-                step=0.1,
-                label="引导强度（CFG）",
-                info="默认 2.0。",
-            )
-            pp = gr.Checkbox(
-                label="预处理参考音频",
-                value=True,
-                info="对参考音频进行静音移除和裁剪，并在参考文本末尾补充标点。",
-            )
-            po = gr.Checkbox(
-                label="后处理输出音频",
-                value=True,
-                info="移除生成音频中的长静音。",
-            )
-        return ns, gs, dn, sp, du, pp, po
-
-    with gr.Blocks(theme=theme, css=css, title="OmniVoice 演示") as demo:
-        
-        model_select = gr.Dropdown(
-            label="模型",
-            choices=list(model_choices.keys()),
-            value=default_model_name,
-            interactive=True,
-        )
-
-        with gr.Tabs():
-            # ==============================================================
-            # Voice Clone
-            # ==============================================================
-            with gr.TabItem("声音克隆"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        vc_text = gr.Textbox(
-                            label="待合成文本",
-                            lines=4,
-                            placeholder="请输入要合成的文本...",
-                        )
-                        vc_ref_audio = gr.Audio(
-                            label="参考音频",
-                            type="filepath",
-                            elem_classes="compact-audio",
-                        )
-                        gr.Markdown(
-                            "<span style='font-size:0.85em;color:#888;'>"
-                            "建议上传 3 到 10 秒的参考音频。"
-                            "</span>"
-                        )
-                        vc_ref_text = gr.Textbox(
-                            label="参考音频文本（可选）",
-                            lines=2,
-                            placeholder="参考音频对应文本。留空时将使用 ASR 自动识别。",
-                        )
-                        vc_lang = _lang_dropdown("语言（可选）")
-                        with gr.Accordion("提示词（可选）", open=False):
-                            vc_instruct = gr.Textbox(label="提示词", lines=2)
-                        (
-                            vc_ns,
-                            vc_gs,
-                            vc_dn,
-                            vc_sp,
-                            vc_du,
-                            vc_pp,
-                            vc_po,
-                        ) = _gen_settings()
-                    with gr.Column(scale=1):
-                        vc_audio_path = gr.State(value=None)
-                        vc_audio = gr.Audio(
-                            label="合成结果",
-                            type="filepath",
-                            autoplay=True,
-                            interactive=True,
-                            sources=[],
-                            buttons=["download"],
-                        )
-                        vc_btn = gr.Button("生成", variant="primary")
-                        vc_save_btn = gr.Button("保存裁剪结果")
-                        vc_download_file = gr.File(
-                            label="下载文件",
-                            elem_id="vc_download_file",
-                            show_label=False,
-                        )
-                        vc_status = gr.Textbox(label="状态", lines=2)
-
-                def _clone_fn(
-                    model_name,
-                    text,
-                    lang,
-                    ref_aud,
-                    ref_text,
-                    instruct,
-                    ns,
-                    gs,
-                    dn,
-                    sp,
-                    du,
-                    pp,
-                    po,
-                ):
-                    return _gen(
-                        model_name,
-                        text,
-                        lang,
-                        ref_aud,
-                        instruct,
-                        ns,
-                        gs,
-                        dn,
-                        sp,
-                        du,
-                        pp,
-                        po,
-                        mode="clone",
-                        ref_text=ref_text or None,
+            out_audio = gr.Audio(
+                    label="合成结果",
+                    type="filepath",
+                    autoplay=True,
+                    interactive=True,
+                    sources=[],
+                    buttons=None
+                )
+            out_audio_path = gr.State(value=None)
+            download_file = gr.File(
+                    label="下载文件",
+                    elem_id="vc_download_file",
+                    show_label=False,
+                    visible=True,
+                )
+            out_status = gr.Textbox(label="状态", lines=2)
+        with gr.Row():
+            btn_gen = gr.Button("🚀 立即生成", variant="primary")
+            btn_save = gr.Button("💾 下载")
+        with gr.Row(equal_height=True):
+                ref_audio = gr.Audio(
+                    label="参考音频（可选，提供时启用克隆）",
+                    type="filepath",
+                    elem_classes="compact-audio",
+                )
+                ref_text = gr.Textbox(
+                        label="参考音频文本（可选）",
+                        lines=4,
+                        placeholder="参考音频对应文本。",
                     )
-
-                vc_btn.click(
-                    _clone_fn,
-                    inputs=[
-                        model_select,
-                        vc_text,
-                        vc_lang,
-                        vc_ref_audio,
-                        vc_ref_text,
-                        vc_instruct,
-                        vc_ns,
-                        vc_gs,
-                        vc_dn,
-                        vc_sp,
-                        vc_du,
-                        vc_pp,
-                        vc_po,
-                    ],
-                    outputs=[vc_audio, vc_status, vc_audio_path],
-                    concurrency_id="gpu_infer",
-                    concurrency_limit=concurrency_limit,
-                )
-                vc_ref_audio.upload(
-                    _transcribe_ref_audio,
-                    inputs=[model_select, vc_ref_audio],
-                    outputs=[vc_ref_text, vc_status],
-                    concurrency_id="gpu_infer",
-                    concurrency_limit=concurrency_limit,
-                )
-                vc_save_event = vc_save_btn.click(
-                    _save_edited_audio,
-                    inputs=[vc_audio, vc_audio_path],
-                    outputs=[vc_audio, vc_status, vc_audio_path, vc_download_file],
-                )
-                vc_save_event.then(fn=None, js=auto_download_js, queue=False)
-
-            # ==============================================================
-            # Voice Design
-            # ==============================================================
-            with gr.TabItem("声音设计"):
+                with gr.Column():
+                    set_sp = gr.Slider(
+                        0.5, 1.5, value=1.0, step=0.05, label="语速", info="1.0 为正常语速，大于 1 更快，小于 1 更慢。"
+                    )
+                    use_random_seed = gr.Checkbox(label="随机生成种子", value=True, info="选中时每次生成新种子。")
+                    set_seed = gr.Number(value=0, label="固定种子 (Seed)", info="取消选中上方选项以固定种子。", precision=0)
+                        
+        # 高级设置与设计选项
+        with gr.Row():
+            with gr.Accordion("🎨 声音引导提示词 (可选)", open=True):
+                _AUTO = _AUTO_LABEL
+                vd_groups = []
+                cats = list(_CATEGORIES.items())
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        vd_text = gr.Textbox(
-                            label="待合成文本",
-                            lines=4,
-                            placeholder="请输入要合成的文本...",
-                        )
-                        vd_lang = _lang_dropdown()
-
-                        _AUTO = _AUTO_LABEL
-                        vd_groups = []
-                        for _cat, _choices in _CATEGORIES.items():
+                    with gr.Column():
+                        for _cat, _choices in cats[:2]:
                             vd_groups.append(
-                                gr.Dropdown(
-                                    label=_cat,
-                                    choices=[_AUTO] + _choices,
-                                    value=_AUTO,
-                                    info=_ATTR_INFO.get(_cat),
-                                )
+                                gr.Dropdown(label=_cat, choices=[_AUTO] + _choices, value=_AUTO)
                             )
+                    with gr.Column():
+                        for _cat, _choices in cats[2:4]:
+                            vd_groups.append(
+                                gr.Dropdown(label=_cat, choices=[_AUTO] + _choices, value=_AUTO)
+                            )
+                    with gr.Column():
+                        for _cat, _choices in cats[4:]:
+                            vd_groups.append(
+                                gr.Dropdown(label=_cat, choices=[_AUTO] + _choices, value=_AUTO)
+                            )
+                instruct_text = gr.Textbox(label="生成的提示词 (Instruct)", lines=1, interactive=False)
 
-                        (
-                            vd_ns,
-                            vd_gs,
-                            vd_dn,
-                            vd_sp,
-                            vd_du,
-                            vd_pp,
-                            vd_po,
-                        ) = _gen_settings()
-                    with gr.Column(scale=1):
-                        vd_audio_path = gr.State(value=None)
-                        vd_audio = gr.Audio(
-                            label="合成结果",
-                            type="filepath",
-                            autoplay=True,
-                            interactive=True,
-                            sources=[],
-                            buttons=["download"],
-                        )
-                        vd_btn = gr.Button("生成", variant="primary")
-                        vd_save_btn = gr.Button("保存裁剪结果")
-                        vd_download_file = gr.File(
-                            label="下载文件",
-                            elem_id="vd_download_file",
-                            show_label=False,
-                        )
-                        vd_status = gr.Textbox(label="状态", lines=2)
-
-                def _build_instruct(groups):
-                    """Extract instruct text from UI dropdowns.
-
-                    Language unification and validation is handled by
-                    _resolve_instruct inside _preprocess_all.
-                    """
+                def _update_instruct(*groups):
                     selected = [g for g in groups if g and g != _AUTO_LABEL]
-                    if not selected:
-                        return None
                     parts = []
                     for v in selected:
                         if " / " in v:
                             en, zh = v.split(" / ", 1)
-                            # Dialects have no English equivalent
                             if "Dialect" in v.split(" / ")[0]:
                                 parts.append(zh.strip())
                             else:
@@ -846,50 +684,86 @@ def build_demo(
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(
-                    model_name, text, lang, ns, gs, dn, sp, du, pp, po, *groups
-                ):
-                    return _gen(
-                        model_name,
-                        text,
-                        lang,
-                        None,
-                        _build_instruct(groups),
-                        ns,
-                        gs,
-                        dn,
-                        sp,
-                        du,
-                        pp,
-                        po,
-                        mode="design",
-                    )
+                for dd in vd_groups:
+                    dd.change(_update_instruct, inputs=vd_groups, outputs=instruct_text)
 
-                vd_btn.click(
-                    _design_fn,
-                    inputs=[
-                        model_select,
-                        vd_text,
-                        vd_lang,
-                        vd_ns,
-                        vd_gs,
-                        vd_dn,
-                        vd_sp,
-                        vd_du,
-                        vd_pp,
-                        vd_po,
-                    ]
-                    + vd_groups,
-                    outputs=[vd_audio, vd_status, vd_audio_path],
-                    concurrency_id="gpu_infer",
-                    concurrency_limit=concurrency_limit,
-                )
-                vd_save_event = vd_save_btn.click(
-                    _save_edited_audio,
-                    inputs=[vd_audio, vd_audio_path],
-                    outputs=[vd_audio, vd_status, vd_audio_path, vd_download_file],
-                )
-                vd_save_event.then(fn=None, js=auto_download_js, queue=False)
+            with gr.Accordion("⚙️ 高级生成设置", open=True):
+                    
+                with gr.Row():
+                    set_du = gr.Number(value=None, label="固定时长（秒）", info="留空则使用语速控制。")
+                    set_ns = gr.Slider(4, 64, value=32, step=1, label="推理步数", info="默认 32。")
+                    set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
+                with gr.Row():
+                    set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
+                    set_pp = gr.Checkbox(label="预处理参考音频", value=False, info="静音移除、裁剪、补充标点。")
+                    set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
+
+
+        def _unified_fn(
+            model_name, text, lang,
+            r_aud, r_txt,
+            final_instruct,
+            ns, gs, dn, sp, du, pp, po, use_rand, seed_val
+        ):
+            if not final_instruct or not final_instruct.strip():
+                final_instruct = None
+            else:
+                final_instruct = final_instruct.strip()
+            
+            return _gen(
+                model_name,
+                text,
+                lang,
+                r_aud,
+                final_instruct,
+                ns,
+                gs,
+                dn,
+                sp,
+                du,
+                pp,
+                po,
+                use_rand,
+                seed_val,
+                ref_text=r_txt or None,
+            )
+
+        btn_gen.click(
+            _unified_fn,
+            inputs=[
+                model_select,
+                target_text,
+                target_lang,
+                ref_audio,
+                ref_text,
+                instruct_text,
+                set_ns,
+                set_gs,
+                set_dn,
+                set_sp,
+                set_du,
+                set_pp,
+                set_po,
+                use_random_seed,
+                set_seed,
+            ],
+            outputs=[out_audio, out_status, out_audio_path, set_seed],
+            concurrency_id="gpu_infer",
+            concurrency_limit=concurrency_limit,
+        )
+        ref_audio.upload(
+            _transcribe_ref_audio,
+            inputs=[ref_audio],
+            outputs=[ref_text, out_status],
+            concurrency_id="asr",
+            concurrency_limit=4,
+        )
+        save_event = btn_save.click(
+            _save_edited_audio,
+            inputs=[out_audio, out_audio_path],
+            outputs=[out_audio, out_status, out_audio_path, download_file],
+        )
+        save_event.then(fn=None, js=auto_download_js, queue=False)
 
     return demo
 
@@ -922,11 +796,7 @@ def main(argv=None) -> int:
         model = OmniVoice.from_pretrained(
             model_id,
             device_map=device,
-            dtype=torch.float16,
-            load_asr=not args.no_asr,
-            asr_backend=args.asr_backend,
-            asr_model_name=args.asr_model,
-            asr_num_threads=args.asr_threads,
+            dtype=torch.float16
         )
         model.eval()
         return model

@@ -82,9 +82,6 @@ from omnivoice.utils.voice_design import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SHERPA_ASR_MODEL = "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14"
-DEFAULT_WHISPER_ASR_MODEL = "openai/whisper-large-v3-turbo"
-
 _AUDIO_TOKENIZER_CACHE_LOCK = threading.Lock()
 _AUDIO_TOKENIZER_CACHE: dict[tuple[str, str], tuple[Any, Any, int, threading.Lock]] = {}
 
@@ -137,6 +134,7 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    seed: Optional[int] = None
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -284,18 +282,11 @@ class OmniVoice(PreTrainedModel):
         self.audio_tokenizer = None
         self.duration_estimator = None
         self.sampling_rate = None
-        self._asr_pipe = None
-        self._asr_backend = None
-        self._asr_lock = threading.Lock()
         self._audio_tokenizer_lock = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
-        load_asr = kwargs.pop("load_asr", False)
-        asr_backend = kwargs.pop("asr_backend", "sherpa")
-        asr_model_name = kwargs.pop("asr_model_name", None)
-        asr_num_threads = kwargs.pop("asr_num_threads", 1)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
@@ -328,116 +319,11 @@ class OmniVoice(PreTrainedModel):
 
                 model.duration_estimator = RuleDurationEstimator()
 
-                if load_asr:
-                    model.load_asr_model(
-                        model_name=asr_model_name,
-                        backend=asr_backend,
-                        num_threads=asr_num_threads,
-                    )
         finally:
             logging.disable(_prev_disable)
 
         return model
 
-    # -------------------------------------------------------------------
-    # ASR support (optional, for auto-transcription)
-    # -------------------------------------------------------------------
-
-    def load_asr_model(
-        self,
-        model_name: Optional[str] = None,
-        backend: str = "sherpa",
-        num_threads: int = 1,
-    ):
-        """Load an ASR model for reference audio transcription.
-
-        Args:
-            model_name: ASR model path or HuggingFace repo id.
-            backend: "sherpa" for sherpa-onnx or "whisper" for Transformers Whisper.
-            num_threads: Number of CPU threads used by sherpa-onnx.
-        """
-        backend = backend.lower().strip()
-        self._asr_backend = backend
-
-        if backend == "sherpa":
-            from omnivoice.utils.sherpa_asr import (
-                SherpaAsrConfig,
-                create_offline_recognizer,
-            )
-
-            model_name = model_name or DEFAULT_SHERPA_ASR_MODEL
-            logger.info("Loading sherpa-onnx ASR model %s ...", model_name)
-            self._asr_pipe = create_offline_recognizer(
-                SherpaAsrConfig(
-                    model=model_name,
-                    num_threads=max(1, int(num_threads)),
-                )
-            )
-            logger.info("ASR model loaded with sherpa-onnx.")
-            return
-
-        if backend == "whisper":
-            from transformers import pipeline as hf_pipeline
-
-            model_name = model_name or DEFAULT_WHISPER_ASR_MODEL
-            logger.info("Loading Whisper ASR model %s ...", model_name)
-            asr_dtype = (
-                torch.float16
-                if str(self.device).startswith(("cuda", "xpu"))
-                else torch.float32
-            )
-            model_name = _resolve_model_path(model_name)
-            self._asr_pipe = hf_pipeline(
-                "automatic-speech-recognition",
-                model=model_name,
-                dtype=asr_dtype,
-                device_map=self.device,
-            )
-            logger.info("ASR model loaded with Whisper on %s.", self.device)
-            return
-
-        raise ValueError(
-            "Unsupported ASR backend: %s. Use 'sherpa' or 'whisper'." % backend
-        )
-
-    @torch.inference_mode()
-    def transcribe(
-        self,
-        audio: Union[str, tuple],
-    ) -> str:
-        """Transcribe audio using the loaded ASR model."""
-        if self._asr_pipe is None:
-            raise RuntimeError(
-                "ASR model is not loaded. Call model.load_asr_model() first."
-            )
-
-        with self._asr_lock:
-            if self._asr_backend == "sherpa":
-                from omnivoice.utils.sherpa_asr import transcribe
-
-                return transcribe(self._asr_pipe, audio)
-
-            if self._asr_backend == "whisper":
-                generate_kwargs = {"task": "transcribe"}
-
-                if isinstance(audio, str):
-                    return self._asr_pipe(
-                        audio, generate_kwargs=generate_kwargs
-                    )["text"].strip()
-
-                waveform, sr = audio
-                if isinstance(waveform, torch.Tensor):
-                    waveform = waveform.cpu().numpy()
-                waveform = np.squeeze(waveform)
-                audio_input = {
-                    "array": waveform,
-                    "sampling_rate": sr,
-                }
-                return self._asr_pipe(
-                    audio_input, generate_kwargs=generate_kwargs
-                )["text"].strip()
-
-        raise RuntimeError("ASR backend is not initialized correctly.")
 
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
@@ -645,6 +531,11 @@ class OmniVoice(PreTrainedModel):
             else OmniVoiceGenerationConfig.from_dict(kwargs)
         )
 
+        generator = None
+        if gen_config.seed is not None:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(gen_config.seed)
+
         self.eval()
 
         full_task = self._preprocess_all(
@@ -667,13 +558,13 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
+            short_results = self._generate_iterative(short_task, gen_config, generator)
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
         if long_idx:
             long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
+            long_results = self._generate_chunked(long_task, gen_config, generator)
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
@@ -699,9 +590,7 @@ class OmniVoice(PreTrainedModel):
         Args:
             ref_audio: File path (str) or ``(waveform, sample_rate)`` tuple.
                 waveform should be a 1-D or 2-D torch.Tensor (channels x samples).
-            ref_text: Transcript of the reference audio. If ``None``, the
-                ASR model will be used to auto-transcribe (must call
-                :meth:`load_asr_model` first).
+            ref_text: Transcript of the reference audio.
             preprocess_prompt: If ``True`` (default), apply silence removal and
                 trimming to the reference audio, add punctuation in the end
                 of reference text (if not already)
@@ -766,14 +655,6 @@ class OmniVoice(PreTrainedModel):
                 "quality. We recommend trimming it to 3-10s.",
                 ref_duration,
             )
-
-        # Auto-transcribe if ref_text not provided
-        if ref_text is None:
-            if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
-            ref_text = self.transcribe((ref_wav, self.sampling_rate))
-            logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.shape[-1] % chunk_size)
@@ -877,7 +758,7 @@ class OmniVoice(PreTrainedModel):
         return generated_audio
 
     def _generate_chunked(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig, generator: Optional[torch.Generator] = None
     ) -> List[List[torch.Tensor]]:
         """Generate long audio by splitting text into chunks and batching.
 
@@ -942,7 +823,7 @@ class OmniVoice(PreTrainedModel):
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
+            gen_tokens = self._generate_iterative(sub_task, gen_config, generator)
             for j, idx in enumerate(indices):
                 chunk_results[idx].append(gen_tokens[j])
 
@@ -1235,7 +1116,7 @@ class OmniVoice(PreTrainedModel):
         }
 
     def _generate_iterative(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig, generator: Optional[torch.Generator] = None
     ) -> List[torch.Tensor]:
         """N-step iterative unmasked decoding.
 
@@ -1363,13 +1244,13 @@ class OmniVoice(PreTrainedModel):
                 u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
 
                 pred_tokens, scores = self._predict_tokens_with_scoring(
-                    c_logits, u_logits, gen_config
+                    c_logits, u_logits, gen_config, generator
                 )
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, gen_config.position_temperature)
+                    scores = _gumbel_sample(scores, gen_config.position_temperature, generator)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(
@@ -1388,7 +1269,7 @@ class OmniVoice(PreTrainedModel):
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
-    def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
+    def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config, generator: Optional[torch.Generator] = None):
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1)
             u_log_probs = F.log_softmax(u_logits, dim=-1)
@@ -1404,7 +1285,7 @@ class OmniVoice(PreTrainedModel):
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)
             pred_tokens = _gumbel_sample(
-                filtered_probs, gen_config.class_temperature
+                filtered_probs, gen_config.class_temperature, generator
             ).argmax(dim=-1)
         else:
             pred_tokens = log_probs.argmax(dim=-1)
@@ -1591,9 +1472,12 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
     return probs
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
     scaled_logits = logits / temperature
-    u = torch.rand_like(scaled_logits)
+    if generator is not None:
+        u = torch.rand(scaled_logits.shape, generator=generator, device=scaled_logits.device, dtype=scaled_logits.dtype)
+    else:
+        u = torch.rand_like(scaled_logits)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 

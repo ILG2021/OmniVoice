@@ -28,3 +28,4 @@ examples/exp*
 .claude/
 *.wav
 *.jsonl
+models_asr/
