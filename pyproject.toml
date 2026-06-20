@@ -89,6 +89,9 @@ constraint-dependencies = [
     "torchaudio==2.8.0",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.sdist]
 include = ["omnivoice"]
 
