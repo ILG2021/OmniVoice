@@ -1474,10 +1474,10 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
 
 def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
     scaled_logits = logits / temperature
-    if generator is not None:
-        u = torch.rand(scaled_logits.shape, generator=generator, device=scaled_logits.device, dtype=scaled_logits.dtype)
-    else:
-        u = torch.rand_like(scaled_logits)
+    # if generator is not None:
+    #     u = torch.rand(scaled_logits.shape, generator=generator, device=scaled_logits.device, dtype=scaled_logits.dtype)
+    # else:
+    u = torch.rand_like(scaled_logits)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 

@@ -312,7 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="k2-fsa/OmniVoice",
+        default="默认",
         help="Fallback model checkpoint path or HuggingFace repo id.",
     )
     parser.add_argument(
@@ -585,7 +585,7 @@ def build_demo(
     }
     """
 
-    def _lang_dropdown(label="语言（可选）", value="Chinese"):
+    def _lang_dropdown(label="语言（可选）", value=_AUTO_LABEL):
         return gr.Dropdown(
             label=label,
             choices=_ALL_LANGUAGES,
@@ -615,7 +615,8 @@ def build_demo(
                     autoplay=True,
                     interactive=True,
                     sources=[],
-                    buttons=None
+                    show_download_button=False,
+                    show_share_button=False
                 )
             out_audio_path = gr.State(value=None)
             download_file = gr.File(
@@ -636,7 +637,7 @@ def build_demo(
                 )
                 ref_text = gr.Textbox(
                         label="参考音频文本（可选）",
-                        lines=4,
+                        lines=10,
                         placeholder="参考音频对应文本。",
                     )
                 with gr.Column():
@@ -694,8 +695,8 @@ def build_demo(
                     set_ns = gr.Slider(4, 64, value=32, step=1, label="推理步数", info="默认 32。")
                     set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
                 with gr.Row():
-                    set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
-                    set_pp = gr.Checkbox(label="预处理参考音频", value=False, info="静音移除、裁剪、补充标点。")
+                    set_dn = gr.Checkbox(label="降噪", value=True, info="默认开启。")
+                    set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 
 
@@ -787,12 +788,13 @@ def main(argv=None) -> int:
     if not fallback_model:
         parser.print_help()
         return 0
-
     model_choices = discover_models(args.model_root, fallback_model)
     logging.info("Discovered models: %s", model_choices)
 
     def _load_model(model_id: str) -> OmniVoice:
         logging.info("Loading model from %s, device=%s ...", model_id, device)
+        if model_id == "默认":
+            model_id = "k2-fsa/OmniVoice"
         model = OmniVoice.from_pretrained(
             model_id,
             device_map=device,
