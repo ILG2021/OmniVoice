@@ -615,8 +615,6 @@ def build_demo(
                     autoplay=True,
                     interactive=True,
                     sources=[],
-                    show_download_button=False,
-                    show_share_button=False
                 )
             out_audio_path = gr.State(value=None)
             download_file = gr.File(
