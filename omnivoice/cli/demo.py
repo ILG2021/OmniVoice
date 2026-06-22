@@ -16,7 +16,6 @@
 # limitations under the License.
 """
 Gradio demo for OmniVoice.
-
 Supports voice cloning and voice design.
 
 Usage:
@@ -28,7 +27,6 @@ import collections
 import gc
 import logging
 import os
-import secrets
 import threading
 from typing import Any, Callable, Dict
 
@@ -405,25 +403,13 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
-        use_random_seed,
-        seed,
         ref_text=None,
     ):
-        if use_random_seed:
-            seed_val = secrets.randbelow(2**31)
-        else:
-            try:
-                seed_val = int(seed)
-                if seed_val < 0:
-                    seed_val = secrets.randbelow(2**31)
-            except (TypeError, ValueError):
-                seed_val = secrets.randbelow(2**31)
-
         model_id = model_choices.get(model_name)
         if model_id is None:
-            return None, f"未知模型：{model_name}", None, seed_val
+            return None, f"未知模型：{model_name}", None
         if not text or not text.strip():
-            return None, "请输入要合成的文本。", None, seed_val
+            return None, "请输入要合成的文本。", None
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
@@ -431,7 +417,6 @@ def build_demo(
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
-            seed=seed_val,
         )
 
         lang = language if (language and language != _AUTO_LABEL) else None
@@ -462,7 +447,7 @@ def build_demo(
 
                 audio = model.generate(**kw)
         except Exception as e:
-            return None, f"错误：{type(e).__name__}: {e}", None, seed_val
+            return None, f"错误：{type(e).__name__}: {e}", None
         finally:
             if acquired:
                 model_cache.release(model_id)
@@ -493,11 +478,11 @@ def build_demo(
         filename = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}--seed{seed_val}--last_audio.wav"
+            f"spd{speed_label}--last_audio.wav"
         )
         output_path = os.path.join(last_audio_path, filename)
         sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
-        return output_path, "完成。", output_path, seed_val
+        return output_path, "完成。", output_path
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
@@ -537,7 +522,7 @@ def build_demo(
             target_path,
         )
 
-    def _transcribe_ref_audio(audio_path):
+    def _transcribe_ref_audio(audio_path, add_punctuation):
         """转录前先检测音频时长，超过限制直接返回提示，避免长音频占用转录队列"""
         MAX_REF_AUDIO_DURATION = 15
         if not audio_path or not os.path.exists(audio_path):
@@ -551,7 +536,9 @@ def build_demo(
             return gr.update(), f"读取音频时长失败: {e}"
             
         try:
-            text = asr_sherpaonnx.transcribe(audio_path)
+            text = asr_sherpaonnx.transcribe(
+                audio_path, add_punctuation=bool(add_punctuation)
+            )
             return gr.update(value=text), "参考音频已转录，可直接修改参考文本。"
         except Exception as e:
             return gr.update(), f"转录失败：{e}"
@@ -642,8 +629,10 @@ def build_demo(
                     set_sp = gr.Slider(
                         0.5, 1.5, value=1.0, step=0.05, label="语速", info="1.0 为正常语速，大于 1 更快，小于 1 更慢。"
                     )
-                    use_random_seed = gr.Checkbox(label="随机生成种子", value=True, info="选中时每次生成新种子。")
-                    set_seed = gr.Number(value=0, label="固定种子 (Seed)", info="取消选中上方选项以固定种子。", precision=0)
+                    ref_punctuation = gr.Checkbox(
+                        label="自动参考文本包含标点",
+                        value=False,
+                    )
                         
         # 高级设置与设计选项
         with gr.Row():
@@ -702,7 +691,7 @@ def build_demo(
             model_name, text, lang,
             r_aud, r_txt,
             final_instruct,
-            ns, gs, dn, sp, du, pp, po, use_rand, seed_val
+            ns, gs, dn, sp, du, pp, po
         ):
             if not final_instruct or not final_instruct.strip():
                 final_instruct = None
@@ -722,8 +711,6 @@ def build_demo(
                 du,
                 pp,
                 po,
-                use_rand,
-                seed_val,
                 ref_text=r_txt or None,
             )
 
@@ -743,19 +730,51 @@ def build_demo(
                 set_du,
                 set_pp,
                 set_po,
-                use_random_seed,
-                set_seed,
             ],
-            outputs=[out_audio, out_status, out_audio_path, set_seed],
+            outputs=[out_audio, out_status, out_audio_path],
             concurrency_id="gpu_infer",
             concurrency_limit=concurrency_limit,
         )
         ref_audio.upload(
             _transcribe_ref_audio,
-            inputs=[ref_audio],
+            inputs=[ref_audio, ref_punctuation],
             outputs=[ref_text, out_status],
             concurrency_id="asr",
             concurrency_limit=4,
+        )
+        ref_punctuation.change(
+            fn=None,
+            inputs=[ref_punctuation],
+            js="""
+            (value) => {
+                try {
+                    localStorage.setItem(
+                        "omnivoice_ref_text_add_punctuation",
+                        value ? "true" : "false"
+                    );
+                } catch (e) {}
+                return [];
+            }
+            """,
+            queue=False,
+        )
+        demo.load(
+            fn=None,
+            outputs=[ref_punctuation],
+            js="""
+            () => {
+                try {
+                    return [
+                        localStorage.getItem(
+                            "omnivoice_ref_text_add_punctuation"
+                        ) === "true"
+                    ];
+                } catch (e) {
+                    return [false];
+                }
+            }
+            """,
+            queue=False,
         )
         save_event = btn_save.click(
             _save_edited_audio,

@@ -134,7 +134,6 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
-    seed: Optional[int] = None
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -531,11 +530,6 @@ class OmniVoice(PreTrainedModel):
             else OmniVoiceGenerationConfig.from_dict(kwargs)
         )
 
-        generator = None
-        if gen_config.seed is not None:
-            generator = torch.Generator(device=self.device)
-            generator.manual_seed(gen_config.seed)
-
         self.eval()
 
         full_task = self._preprocess_all(
@@ -558,13 +552,13 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config, generator)
+            short_results = self._generate_iterative(short_task, gen_config)
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
         if long_idx:
             long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config, generator)
+            long_results = self._generate_chunked(long_task, gen_config)
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
@@ -758,7 +752,7 @@ class OmniVoice(PreTrainedModel):
         return generated_audio
 
     def _generate_chunked(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig, generator: Optional[torch.Generator] = None
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
     ) -> List[List[torch.Tensor]]:
         """Generate long audio by splitting text into chunks and batching.
 
@@ -823,7 +817,7 @@ class OmniVoice(PreTrainedModel):
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config, generator)
+            gen_tokens = self._generate_iterative(sub_task, gen_config)
             for j, idx in enumerate(indices):
                 chunk_results[idx].append(gen_tokens[j])
 
@@ -1116,7 +1110,7 @@ class OmniVoice(PreTrainedModel):
         }
 
     def _generate_iterative(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig, generator: Optional[torch.Generator] = None
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
     ) -> List[torch.Tensor]:
         """N-step iterative unmasked decoding.
 
@@ -1244,13 +1238,13 @@ class OmniVoice(PreTrainedModel):
                 u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
 
                 pred_tokens, scores = self._predict_tokens_with_scoring(
-                    c_logits, u_logits, gen_config, generator
+                    c_logits, u_logits, gen_config
                 )
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, gen_config.position_temperature, generator)
+                    scores = _gumbel_sample(scores, gen_config.position_temperature)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(
@@ -1269,7 +1263,7 @@ class OmniVoice(PreTrainedModel):
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
-    def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config, generator: Optional[torch.Generator] = None):
+    def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1)
             u_log_probs = F.log_softmax(u_logits, dim=-1)
@@ -1285,7 +1279,7 @@ class OmniVoice(PreTrainedModel):
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)
             pred_tokens = _gumbel_sample(
-                filtered_probs, gen_config.class_temperature, generator
+                filtered_probs, gen_config.class_temperature
             ).argmax(dim=-1)
         else:
             pred_tokens = log_probs.argmax(dim=-1)
@@ -1472,11 +1466,8 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
     return probs
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     scaled_logits = logits / temperature
-    # if generator is not None:
-    #     u = torch.rand(scaled_logits.shape, generator=generator, device=scaled_logits.device, dtype=scaled_logits.dtype)
-    # else:
     u = torch.rand_like(scaled_logits)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
