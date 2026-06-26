@@ -31,9 +31,9 @@ import threading
 from typing import Any, Callable, Dict
 
 # Set Gradio temp directory to a local folder to avoid tmpfs RAM consumption on Linux
-# if "GRADIO_TEMP_DIR" not in os.environ:
-#     os.environ["GRADIO_TEMP_DIR"] = os.path.abspath("gradio_tmp")
-# os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
+if "GRADIO_TEMP_DIR" not in os.environ:
+    os.environ["GRADIO_TEMP_DIR"] = os.path.abspath("gradio_tmp")
+os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
 
 import gradio as gr
 import numpy as np
@@ -849,11 +849,19 @@ def main(argv=None) -> int:
         concurrency_limit=concurrency_limit,
     )
 
+    import tempfile
+    allowed_paths = [os.path.abspath("gradio_tmp")]
+    try:
+        allowed_paths.append(tempfile.gettempdir())
+    except Exception:
+        pass
+
     demo.queue(default_concurrency_limit=concurrency_limit).launch(
         server_name=args.ip,
         server_port=args.port,
         share=args.share,
         root_path=args.root_path,
+        allowed_paths=allowed_paths,
     )
     return 0
 
