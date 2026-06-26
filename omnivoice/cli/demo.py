@@ -30,6 +30,11 @@ import os
 import threading
 from typing import Any, Callable, Dict
 
+# Set Gradio temp directory to a local folder to avoid tmpfs RAM consumption on Linux
+if "GRADIO_TEMP_DIR" not in os.environ:
+    os.environ["GRADIO_TEMP_DIR"] = os.path.abspath("gradio_tmp")
+os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
+
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -172,6 +177,15 @@ def _cleanup_torch_cache(device=None):
             torch.cuda.ipc_collect()
         elif device_str.startswith("xpu") and hasattr(torch, "xpu"):
             torch.xpu.empty_cache()
+        
+        # Force glibc to release free memory back to the OS on Linux
+        if os.name == "posix":
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception:
+                pass
     except Exception:
         logging.debug("Device cache cleanup failed.", exc_info=True)
 
