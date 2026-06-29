@@ -22,6 +22,9 @@ Usage:
     omnivoice-demo --model /path/to/checkpoint --port 8000
 """
 
+import shutil
+from datetime import time
+from aiofiles import tempfile
 import argparse
 import collections
 import gc
@@ -392,6 +395,35 @@ def build_parser() -> argparse.ArgumentParser:
 # Build demo
 # ---------------------------------------------------------------------------
 
+last_cleanup_times = {}
+cleanup_lock = threading.Lock()
+
+
+def delete_old_files_and_dirs(path, days=2):
+    global last_cleanup_times
+    now = time.time()
+    with cleanup_lock:
+        last_time = last_cleanup_times.get(path, 0)
+        if (now - last_time) < 86400:
+            return
+
+        last_cleanup_times[path] = now
+
+    if not os.path.exists(path):
+        return
+
+    cutoff = now - (days * 86400)
+    for item in os.listdir(path):
+        full_path = os.path.join(path, item)
+        try:
+            mtime = os.path.getmtime(full_path)
+            if mtime < cutoff:
+                if os.path.isfile(full_path) or os.path.islink(full_path):
+                    os.remove(full_path)
+                elif os.path.isdir(full_path):
+                    shutil.rmtree(full_path)
+        except Exception as e:
+            print(f"[{path}] 处理时出错: {full_path}, 错误: {e}")
 
 def build_demo(
     model_cache: ModelCache,
@@ -419,6 +451,11 @@ def build_demo(
         postprocess_output,
         ref_text=None,
     ):
+        delete_old_files_and_dirs("./gen_audio", days=2)
+        delete_old_files_and_dirs("./last_audio", days=2)
+        delete_old_files_and_dirs("./tmp", days=2)
+        delete_old_files_and_dirs("./gradio_tmp", days=2)
+
         model_id = model_choices.get(model_name)
         if model_id is None:
             return None, f"未知模型：{model_name}", None
