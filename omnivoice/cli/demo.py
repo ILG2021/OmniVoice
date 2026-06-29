@@ -696,7 +696,7 @@ def build_demo(
                     set_ns = gr.Slider(4, 64, value=32, step=1, label="推理步数", info="默认 32。")
                     set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
                 with gr.Row():
-                    set_dn = gr.Checkbox(label="降噪", value=True, info="默认开启。")
+                    set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
                     set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 
@@ -772,19 +772,38 @@ def build_demo(
             """,
             queue=False,
         )
+        set_dn.change(
+            fn=None,
+            inputs=[set_dn],
+            js="""
+            (value) => {
+                try {
+                    localStorage.setItem(
+                        "omnivoice_set_dn",
+                        value ? "true" : "false"
+                    );
+                } catch (e) {}
+                return [];
+            }
+            """,
+            queue=False,
+        )
         demo.load(
             fn=None,
-            outputs=[ref_punctuation],
+            outputs=[ref_punctuation, set_dn],
             js="""
             () => {
                 try {
                     return [
                         localStorage.getItem(
                             "omnivoice_ref_text_add_punctuation"
+                        ) === "true",
+                        localStorage.getItem(
+                            "omnivoice_set_dn"
                         ) === "true"
                     ];
                 } catch (e) {
-                    return [false];
+                    return [false, false];
                 }
             }
             """,
