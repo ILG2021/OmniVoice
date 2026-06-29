@@ -23,7 +23,7 @@ Usage:
 """
 
 import shutil
-from datetime import time
+import time
 import argparse
 import collections
 import gc
