@@ -24,7 +24,6 @@ Usage:
 
 import shutil
 from datetime import time
-from aiofiles import tempfile
 import argparse
 import collections
 import gc
