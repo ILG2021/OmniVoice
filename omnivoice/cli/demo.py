@@ -30,12 +30,19 @@ import gc
 import logging
 import os
 import threading
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 # Set Gradio temp directory to a local folder to avoid tmpfs RAM consumption on Linux
 if "GRADIO_TEMP_DIR" not in os.environ:
     os.environ["GRADIO_TEMP_DIR"] = os.path.abspath("gradio_tmp")
 os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*HTTP_422_UNPROCESSABLE_ENTITY.*",
+    category=DeprecationWarning,
+)
 
 import gradio as gr
 import numpy as np
@@ -47,6 +54,7 @@ from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 from omnivoice.utils import asr_sherpaonnx
+from omnivoice.utils.audio import cross_fade_chunks
 
 # ---------------------------------------------------------------------------
 # Language list — all 600+ supported languages
@@ -58,58 +66,6 @@ _ALL_LANGUAGES = [_AUTO_LABEL] + sorted(lang_display_name(n) for n in LANG_NAMES
 # ---------------------------------------------------------------------------
 # Voice Design instruction templates
 # ---------------------------------------------------------------------------
-# Each option is displayed as "English / 中文".
-# The model expects English for accents and Chinese for dialects.
-_CATEGORIES = {
-    "Gender / 性别": ["Male / 男", "Female / 女"],
-    "Age / 年龄": [
-        "Child / 儿童",
-        "Teenager / 少年",
-        "Young Adult / 青年",
-        "Middle-aged / 中年",
-        "Elderly / 老年",
-    ],
-    "Pitch / 音调": [
-        "Very Low Pitch / 极低音调",
-        "Low Pitch / 低音调",
-        "Moderate Pitch / 中音调",
-        "High Pitch / 高音调",
-        "Very High Pitch / 极高音调",
-    ],
-    "Style / 风格": ["Whisper / 耳语"],
-    "English Accent / 英文口音": [
-        "American Accent / 美式口音",
-        "Australian Accent / 澳大利亚口音",
-        "British Accent / 英国口音",
-        "Chinese Accent / 中国口音",
-        "Canadian Accent / 加拿大口音",
-        "Indian Accent / 印度口音",
-        "Korean Accent / 韩国口音",
-        "Portuguese Accent / 葡萄牙口音",
-        "Russian Accent / 俄罗斯口音",
-        "Japanese Accent / 日本口音",
-    ],
-    "Chinese Dialect / 中文方言": [
-        "Henan Dialect / 河南话",
-        "Shaanxi Dialect / 陕西话",
-        "Sichuan Dialect / 四川话",
-        "Guizhou Dialect / 贵州话",
-        "Yunnan Dialect / 云南话",
-        "Guilin Dialect / 桂林话",
-        "Jinan Dialect / 济南话",
-        "Shijiazhuang Dialect / 石家庄话",
-        "Gansu Dialect / 甘肃话",
-        "Ningxia Dialect / 宁夏话",
-        "Qingdao Dialect / 青岛话",
-        "Northeast Dialect / 东北话",
-    ],
-}
-
-_ATTR_INFO = {
-    "English Accent / 英文口音": "Only effective for English speech.",
-    "Chinese Dialect / 中文方言": "Only effective for Chinese speech.",
-}
-
 _CATEGORIES = {
     "性别": [("男", "Male"), ("女", "Female")],
     "年龄": [
@@ -528,7 +484,7 @@ def build_demo(
         filename = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}--last_audio.wav"
+            f"spd{speed_label}.wav"
         )
         output_path = os.path.join(last_audio_path, filename)
         sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
@@ -572,29 +528,204 @@ def build_demo(
             target_path,
         )
 
-    def _transcribe_ref_audio(audio_path, add_punctuation):
-        """转录前先检测音频时长，超过限制直接返回提示，避免长音频占用转录队列"""
+    def _transcribe_one(audio_path: str, add_punctuation: bool) -> str:
+        """转录单个音频，返回文本字符串（失败时返回空串）"""
         MAX_REF_AUDIO_DURATION = 15
         if not audio_path or not os.path.exists(audio_path):
-            return gr.update(), "请上传参考音频。"
+            return ""
         try:
             info = sf.info(audio_path)
             if info.duration > MAX_REF_AUDIO_DURATION:
-                gr.Warning(f"参考音频过长（{info.duration:.1f}s），请上传 {MAX_REF_AUDIO_DURATION}s 以内的音频")
-                return gr.update(value=""), "你输入的音频过长"
-        except Exception as e:
-            return gr.update(), f"读取音频时长失败: {e}"
-            
+                gr.Warning(f"{os.path.basename(audio_path)} 过长（{info.duration:.1f}s > {MAX_REF_AUDIO_DURATION}s），已跳过转录")
+                return ""
+        except Exception:
+            pass
         try:
-            text = asr_sherpaonnx.transcribe(
-                audio_path, add_punctuation=bool(add_punctuation)
-            )
-            return gr.update(value=text), "参考音频已转录，可直接修改参考文本。"
+            return asr_sherpaonnx.transcribe(audio_path, add_punctuation=bool(add_punctuation))
         except Exception as e:
-            return gr.update(), f"转录失败：{e}"
+            gr.Warning(f"{os.path.basename(audio_path)} 转录失败：{e}")
+            return ""
+
+    def _transcribe_ref_audios(audio_files, add_punctuation):
+        """批量转录：支持单个或多个参考音频文件。
+        audio_files: None | str | list[str] — gr.File 返回的路径或路径列表
+        """
+        if not audio_files:
+            return gr.update(), "请上传参考音频。"
+
+        # 统一为列表
+        if isinstance(audio_files, str):
+            paths = [audio_files]
+        elif isinstance(audio_files, dict):          # gr.File 单文件有时返回 dict
+            paths = [audio_files.get("name", "") or audio_files.get("path", "")]
+        else:
+            paths = [
+                (f.get("name") or f.get("path") if isinstance(f, dict) else f)
+                for f in audio_files
+            ]
+        paths = [p for p in paths if p]
+
+        if not paths:
+            return gr.update(), "请上传参考音频。"
+
+        results = [_transcribe_one(p, add_punctuation) for p in paths]
+
+        if len(results) == 1:
+            status = "参考音频已转录，可直接修改参考文本。"
+        else:
+            status = f"已批量转录 {len(results)} 个参考音频，每行对应一个音频的文本。"
+
+        combined = "\n".join(results)
+        return gr.update(value=combined), status
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
+
+    def _batch_gen_fn(
+        model_name, text, language,
+        audio_files,
+        ref_text_block,
+        final_instruct,
+        ns, gs, dn, sp, du, pp, po,
+    ):
+        """批量生成：每行 text 对应一个参考音频文件，检查数量一致后逐条生成，拼接为单个音频文件输出。"""
+        # --- 解析文件列表 ---
+        if isinstance(audio_files, str):
+            paths = [audio_files]
+        elif isinstance(audio_files, dict):
+            paths = [audio_files.get("name", "") or audio_files.get("path", "")]
+        elif audio_files:
+            paths = [
+                (f.get("name") or f.get("path") if isinstance(f, dict) else f)
+                for f in audio_files
+            ]
+        else:
+            paths = []
+        paths = [p for p in paths if p]
+
+        # --- 解析文本行 ---
+        lines = [l for l in (text or "").splitlines() if l.strip()]
+
+        if not lines:
+            return None, "请输入要合成的文本（每行一条）。", None, None
+
+        n_audio = len(paths)
+        n_lines = len(lines)
+
+        if n_audio > 1 and n_lines != n_audio:
+            msg = (
+                f"⚠️ 数量不一致：生成文本有 {n_lines} 行，"
+                f"但上传了 {n_audio} 个参考音频。\n"
+                f"请确保每行文本对应一个参考音频（共 {n_audio} 行）。"
+            )
+            gr.Warning(msg)
+            return None, msg, None, None
+
+        # --- 解析参考文本行（可为空） ---
+        ref_lines = [l for l in (ref_text_block or "").splitlines() if l.strip()]
+        # 如果参考文本行数与音频数一致则逐条对应，否则全部用第一条或空
+        def _ref_text_for(idx):
+            if len(ref_lines) > idx:
+                return ref_lines[idx]
+            elif len(ref_lines) == 1:
+                return ref_lines[0]
+            return None
+
+        output_sampling_rate = 48000
+        gen_dir = "gen_audio"
+        os.makedirs(gen_dir, exist_ok=True)
+        delete_old_files_and_dirs(gen_dir, days=2)
+
+        generated_paths: List[str] = []
+        errors: List[str] = []
+
+        for i, (line_text, ref_path) in enumerate(zip(lines, paths if paths else [None] * n_lines)):
+            ref_basename = os.path.basename(ref_path).rpartition(".")[0] if ref_path else "auto"
+            fname = f"{i+1:03d}__{_safe_filename_part(ref_basename)}.wav"
+            out_path = os.path.join(gen_dir, fname)
+
+            _, status_msg, saved_path = _gen(
+                model_name,
+                line_text,
+                language,
+                ref_path,
+                final_instruct,
+                ns, gs, dn, sp, du, pp, po,
+                ref_text=_ref_text_for(i),
+            )
+            if saved_path and os.path.exists(saved_path):
+                shutil.copy2(saved_path, out_path)
+                generated_paths.append(out_path)
+            else:
+                errors.append(f"第 {i+1} 条失败：{status_msg}")
+
+        if not generated_paths:
+            return None, "批量生成全部失败：\n" + "\n".join(errors), None, None
+
+        status = f"批量生成完成，共 {len(generated_paths)} 条"
+        if errors:
+            status += f"，{len(errors)} 条失败：" + "；".join(errors)
+        status += "。"
+
+        # --- 拼接所有生成音频为单文件 ---
+        segments = []
+        for p in generated_paths:
+            data, sr = sf.read(p, dtype="float32", always_2d=False)
+            if sr != output_sampling_rate:
+                t = torch.from_numpy(np.asarray(data, dtype=np.float32))
+                if t.ndim == 1:
+                    t = t.unsqueeze(0)
+                else:
+                    t = t.T
+                data = (
+                    torchaudio.functional.resample(t, orig_freq=sr, new_freq=output_sampling_rate)
+                    .T.squeeze()
+                    .numpy()
+                )
+            # 统一为 (1, T) 供 cross_fade_chunks 使用
+            if data.ndim == 1:
+                data = data[np.newaxis, :]   # (T,) → (1, T)
+            elif data.ndim == 2:
+                data = data.T                # (T, C) → (C, T)
+            segments.append(data)
+        # 拼接：加 0.5 s 静音区 + 交叉淡化
+        merged_audio = cross_fade_chunks(
+            segments,
+            sample_rate=output_sampling_rate,
+            silence_duration=1.0,
+        ).squeeze(0)  # (1, T) → (T,)
+
+        # 文件名：与 _gen_core 保持一致，ref_basename 为各参考音频名以 "+" 拼接
+        # 文件系统限制：Linux/macOS 255 字节，Windows NTFS 255 字符；统一按字节控制
+        _FNAME_MAX_BYTES = 255
+        ref_stems = [
+            _safe_filename_part(os.path.basename(p).rpartition(".")[0])
+            for p in (paths if paths else [])
+        ]
+        speed_label = sp if sp is not None else 1.0
+        ref_basename = "+".join(ref_stems) if ref_stems else "batch"
+        # 先算出除 ref_basename 外的固定字节开销
+        fixed = (
+            f"{_safe_filename_part(model_name)}----spd{speed_label}.wav"
+        ).encode("utf-8")
+        max_ref_bytes = _FNAME_MAX_BYTES - len(fixed)
+        if len(ref_basename.encode("utf-8")) > max_ref_bytes:
+            suffix = f"+…({len(ref_stems)})"
+            budget = max_ref_bytes - len(suffix.encode("utf-8"))
+            # 按字节截断，再安全解码（避免切断多字节字符）
+            ref_basename = (
+                ref_basename.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+                + suffix
+            )
+        merged_fname = (
+            f"{_safe_filename_part(model_name)}--"
+            f"{_safe_filename_part(ref_basename)}--"
+            f"spd{speed_label}.wav"
+        )
+        merged_path = os.path.join(gen_dir, merged_fname)
+        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_32")
+
+        return merged_path, status, merged_path, merged_path
 
     # =====================================================================
     # UI
@@ -614,7 +745,7 @@ def build_demo(
     auto_download_js = """
     () => {
         setTimeout(() => {
-            const links = document.querySelectorAll('#vc_download_file a[href], #vd_download_file a[href]');
+            const links = document.querySelectorAll('#vc_download_file a[href]');
             const link = links[links.length - 1];
             if (link) link.click();
         }, 500);
@@ -644,13 +775,14 @@ def build_demo(
             target_text = gr.Textbox(
                 label="生成文本",
                 lines=4,
-                placeholder="请输入要合成的文本...",
+                placeholder="请输入要合成的文本……（批量模式：每行一条，行数需与参考音频个数一致）",
             )
             out_audio = gr.Audio(
                     label="合成结果",
                     type="filepath",
                     autoplay=True,
                     interactive=True,
+                    buttons=[],
                     sources=[],
                 )
             out_audio_path = gr.State(value=None)
@@ -658,6 +790,7 @@ def build_demo(
                     label="下载文件",
                     elem_id="vc_download_file",
                     show_label=False,
+                    file_count="multiple",
                     visible=True,
                 )
             out_status = gr.Textbox(label="状态", lines=2)
@@ -665,15 +798,16 @@ def build_demo(
             btn_gen = gr.Button("🚀 立即生成", variant="primary")
             btn_save = gr.Button("💾 下载")
         with gr.Row(equal_height=True):
-                ref_audio = gr.Audio(
-                    label="参考音频（可选，提供时启用克隆）",
-                    type="filepath",
+                ref_audio = gr.File(
+                    label="参考音频（可选，支持多文件，提供时启用克隆）",
+                    file_count="multiple",
+                    file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"],
                     elem_classes="compact-audio",
                 )
                 ref_text = gr.Textbox(
-                        label="参考音频文本（可选）",
+                        label="参考音频文本（可选；批量时每行对应一个音频）",
                         lines=10,
-                        placeholder="参考音频对应文本。",
+                        placeholder="参考音频对应文本。批量上传时每行对应一个音频的转录文本。",
                     )
                 with gr.Column():
                     set_sp = gr.Slider(
@@ -725,6 +859,19 @@ def build_demo(
                 for dd in vd_groups:
                     dd.change(_update_instruct, inputs=vd_groups, outputs=instruct_text)
 
+                _auto_val = _AUTO_LABEL
+                _n_vd = len(vd_groups)
+
+                def _reset_vd_groups(_):
+                    return tuple(gr.update(value=_auto_val) for _ in range(_n_vd))
+
+                model_select.change(
+                    _reset_vd_groups,
+                    inputs=[model_select],
+                    outputs=list(vd_groups),
+                    queue=False,
+                )
+
             with gr.Accordion("⚙️ 高级生成设置", open=True):
                     
                 with gr.Row():
@@ -737,6 +884,25 @@ def build_demo(
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 
 
+        def _get_paths(audio_files):
+            """统一解析 gr.File 返回值为路径列表。"""
+            if not audio_files:
+                return []
+            if isinstance(audio_files, str):
+                return [audio_files]
+            if isinstance(audio_files, dict):
+                p = audio_files.get("name") or audio_files.get("path", "")
+                return [p] if p else []
+            result = []
+            for f in audio_files:
+                if isinstance(f, dict):
+                    p = f.get("name") or f.get("path", "")
+                    if p:
+                        result.append(p)
+                elif isinstance(f, str) and f:
+                    result.append(f)
+            return result
+
         def _unified_fn(
             model_name, text, lang,
             r_aud, r_txt,
@@ -747,22 +913,38 @@ def build_demo(
                 final_instruct = None
             else:
                 final_instruct = final_instruct.strip()
-            
-            return _gen(
-                model_name,
-                text,
-                lang,
-                r_aud,
-                final_instruct,
-                ns,
-                gs,
-                dn,
-                sp,
-                du,
-                pp,
-                po,
-                ref_text=r_txt or None,
-            )
+
+            paths = _get_paths(r_aud)
+            n_audio = len(paths)
+
+            # 批量模式：多个音频文件
+            if n_audio > 1:
+                audio_out, status, preview, file_paths = _batch_gen_fn(
+                    model_name, text, lang,
+                    paths,
+                    r_txt,
+                    final_instruct,
+                    ns, gs, dn, sp, du, pp, po,
+                )
+                return (
+                    audio_out,
+                    status,
+                    preview,
+                    file_paths,
+                )
+            else:
+                # 单个模式（0 或 1 个参考音频）
+                single_path = paths[0] if paths else None
+                audio_out, status, saved = _gen(
+                    model_name,
+                    text,
+                    lang,
+                    single_path,
+                    final_instruct,
+                    ns, gs, dn, sp, du, pp, po,
+                    ref_text=r_txt or None,
+                )
+                return audio_out, status, saved, saved
 
         btn_gen.click(
             _unified_fn,
@@ -781,12 +963,12 @@ def build_demo(
                 set_pp,
                 set_po,
             ],
-            outputs=[out_audio, out_status, out_audio_path],
+            outputs=[out_audio, out_status, out_audio_path, download_file],
             concurrency_id="gpu_infer",
             concurrency_limit=concurrency_limit,
         )
         ref_audio.upload(
-            _transcribe_ref_audio,
+            _transcribe_ref_audios,
             inputs=[ref_audio, ref_punctuation],
             outputs=[ref_text, out_status],
             concurrency_id="asr",
@@ -905,7 +1087,11 @@ def main(argv=None) -> int:
     )
 
     import tempfile
-    allowed_paths = [os.path.abspath("gradio_tmp")]
+    allowed_paths = [
+        os.path.abspath("gradio_tmp"),
+        os.path.abspath("gen_audio"),
+        os.path.abspath("last_audio"),
+    ]
     try:
         allowed_paths.append(tempfile.gettempdir())
     except Exception:

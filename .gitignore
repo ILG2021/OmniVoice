@@ -29,3 +29,5 @@ examples/exp*
 *.wav
 *.jsonl
 models_asr/
+models/
+gradio_tmp/

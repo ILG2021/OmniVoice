@@ -91,9 +91,8 @@ def transcribe(audio_path, add_punctuation=False):
     stream.accept_waveform(16000, audio)
     _ASR_RECOGNIZER.decode_stream(stream)
     text_result = stream.result.text
+    text_result = text_result.replace("<unk>", '').strip(" ")
+
     if add_punctuation:
-        text_result = text_result.replace(' "<unk>" ', '，').replace(' "<unk>"', "。")
         text_result = PUNC_MODEL.add_punctuation(text_result)
-    else:
-        text_result = text_result.replace(' "<unk>" ', '').replace(' "<unk>"', "")
     return text_result
