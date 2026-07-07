@@ -753,7 +753,7 @@ def build_demo(
     }
     """
 
-    def _lang_dropdown(label="语言（可选）", value=_AUTO_LABEL):
+    def _lang_dropdown(label="语言（可选）", value="Chinese"):
         return gr.Dropdown(
             label=label,
             choices=_ALL_LANGUAGES,
@@ -797,26 +797,39 @@ def build_demo(
         with gr.Row():
             btn_gen = gr.Button("🚀 立即生成", variant="primary")
             btn_save = gr.Button("💾 下载")
+        # 合并后的参考音频路径（单/多文件共享）
+        merged_ref_audio = gr.State(value=None)
+
         with gr.Row(equal_height=True):
-                ref_audio = gr.File(
-                    label="参考音频（可选，支持多文件，提供时启用克隆）",
-                    file_count="multiple",
-                    file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"],
-                    elem_classes="compact-audio",
+            with gr.Column():
+                with gr.Tabs() as ref_audio_tabs:
+                    with gr.Tab("🎙️ 单参考音频"):
+                        ref_audio_single = gr.Audio(
+                            label="参考音频（可选，支持录音，提供时启用克隆）",
+                            type="filepath",
+                            sources=["upload", "microphone"],
+                            elem_classes="compact-audio",
+                        )
+                    with gr.Tab("📂 多参考批量"):
+                        ref_audio_multi = gr.File(
+                            label="参考音频（支持多文件批量克隆）",
+                            file_count="multiple",
+                            file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"],
+                            elem_classes="compact-audio",
+                        )
+            ref_text = gr.Textbox(
+                    label="参考音频文本（可选；批量时每行对应一个音频）",
+                    lines=10,
+                    placeholder="参考音频对应文本。批量上传时每行对应一个音频的转录文本。",
                 )
-                ref_text = gr.Textbox(
-                        label="参考音频文本（可选；批量时每行对应一个音频）",
-                        lines=10,
-                        placeholder="参考音频对应文本。批量上传时每行对应一个音频的转录文本。",
-                    )
-                with gr.Column():
-                    set_sp = gr.Slider(
-                        0.5, 1.5, value=1.0, step=0.05, label="语速", info="1.0 为正常语速，大于 1 更快，小于 1 更慢。"
-                    )
-                    ref_punctuation = gr.Checkbox(
-                        label="自动参考文本包含标点",
-                        value=False,
-                    )
+            with gr.Column():
+                set_sp = gr.Slider(
+                    0.5, 1.5, value=1.0, step=0.05, label="语速", info="1.0 为正常语速，大于 1 更快，小于 1 更慢。"
+                )
+                ref_punctuation = gr.Checkbox(
+                    label="自动参考文本包含标点",
+                    value=False,
+                )
                         
         # 高级设置与设计选项
         with gr.Row():
@@ -880,12 +893,12 @@ def build_demo(
                     set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
                 with gr.Row():
                     set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
-                    set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
-                    set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
+                    set_pp = gr.Checkbox(label="预处理参考音频", value=False, info="静音移除、裁剪、补充标点。")
+                    set_po = gr.Checkbox(label="后处理输出音频", value=False, info="移除长静音。")
 
 
         def _get_paths(audio_files):
-            """统一解析 gr.File 返回值为路径列表。"""
+            """统一解析 gr.Audio / gr.File 返回值为路径列表。"""
             if not audio_files:
                 return []
             if isinstance(audio_files, str):
@@ -902,6 +915,15 @@ def build_demo(
                 elif isinstance(f, str) and f:
                     result.append(f)
             return result
+
+        def _sync_single(path):
+            """gr.Audio 单文件上传/录音 → 更新 merged_ref_audio State。"""
+            return [path] if path else None
+
+        def _sync_multi(files):
+            """gr.File 多文件上传 → 更新 merged_ref_audio State。"""
+            paths = _get_paths(files)
+            return paths if paths else None
 
         def _unified_fn(
             model_name, text, lang,
@@ -946,13 +968,32 @@ def build_demo(
                 )
                 return audio_out, status, saved, saved
 
+        # --- 同步 State 的回调 ---
+        ref_audio_single.change(
+            _sync_single,
+            inputs=[ref_audio_single],
+            outputs=[merged_ref_audio],
+            queue=False,
+        )
+        ref_audio_multi.upload(
+            _sync_multi,
+            inputs=[ref_audio_multi],
+            outputs=[merged_ref_audio],
+            queue=False,
+        )
+        ref_audio_multi.clear(
+            lambda: (None, gr.update(value="")),
+            outputs=[merged_ref_audio, ref_text],
+            queue=False,
+        )
+
         btn_gen.click(
             _unified_fn,
             inputs=[
                 model_select,
                 target_text,
                 target_lang,
-                ref_audio,
+                merged_ref_audio,
                 ref_text,
                 instruct_text,
                 set_ns,
@@ -967,9 +1008,21 @@ def build_demo(
             concurrency_id="gpu_infer",
             concurrency_limit=concurrency_limit,
         )
-        ref_audio.upload(
+        # 单文件上传/录音 → 自动转录（清除时跳过）
+        ref_audio_single.change(
+            lambda path, punct: (
+                _transcribe_ref_audios([path], punct) if path
+                else (gr.update(value=""), gr.update())
+            ),
+            inputs=[ref_audio_single, ref_punctuation],
+            outputs=[ref_text, out_status],
+            concurrency_id="asr",
+            concurrency_limit=4,
+        )
+        # 多文件上传 → 自动转录
+        ref_audio_multi.upload(
             _transcribe_ref_audios,
-            inputs=[ref_audio, ref_punctuation],
+            inputs=[ref_audio_multi, ref_punctuation],
             outputs=[ref_text, out_status],
             concurrency_id="asr",
             concurrency_limit=4,
