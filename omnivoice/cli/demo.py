@@ -41,7 +41,6 @@ import warnings
 warnings.filterwarnings(
     "ignore",
     message=".*HTTP_422_UNPROCESSABLE_ENTITY.*",
-    category=DeprecationWarning,
 )
 
 import gradio as gr
