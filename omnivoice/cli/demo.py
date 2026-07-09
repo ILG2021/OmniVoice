@@ -413,9 +413,25 @@ def build_demo(
 
         model_id = model_choices.get(model_name)
         if model_id is None:
+            logging.warning("[推理] 未知模型：%s", model_name)
             return None, f"未知模型：{model_name}", None
         if not text or not text.strip():
             return None, "请输入要合成的文本。", None
+
+        # ---- 记录推理请求 ----
+        logging.info(
+            "[推理开始] 模型=%s | 语言=%s | 文本(前200字)=%s | "
+            "参考音频=%s | 参考文本(前100字)=%s | instruct=%s | "
+            "steps=%s cfg=%s speed=%s duration=%s denoise=%s pp=%s po=%s",
+            model_name,
+            language,
+            (text or "").strip()[:200],
+            ref_audio,
+            (ref_text or "")[:100],
+            instruct,
+            num_step, guidance_scale, speed, duration,
+            denoise, preprocess_prompt, postprocess_output,
+        )
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
@@ -437,6 +453,7 @@ def build_demo(
             kw["duration"] = float(duration)
 
         acquired = False
+        _t0 = time.time()
         try:
             with infer_semaphore, torch.inference_mode():
                 model = model_cache.acquire(model_id)
@@ -453,7 +470,15 @@ def build_demo(
 
                 audio = model.generate(**kw)
         except Exception as e:
-            return None, f"错误：{type(e).__name__}: {e}", None
+            logging.error(
+                "[推理失败] 模型=%s 文本(前200字)=%s 参考音频=%s 异常: %s",
+                model_name,
+                (text or "").strip()[:200],
+                ref_audio,
+                e,
+                exc_info=True,
+            )
+            raise gr.Error(f"{type(e).__name__}: {e}")
         finally:
             if acquired:
                 model_cache.release(model_id)
@@ -488,6 +513,11 @@ def build_demo(
         )
         output_path = os.path.join(last_audio_path, filename)
         sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
+        _elapsed = time.time() - _t0
+        logging.info(
+            "[推理完成] 模型=%s 耗时=%.2fs 输出=%s",
+            model_name, _elapsed, output_path,
+        )
         return output_path, "完成。", output_path
 
     def _save_edited_audio(audio_path, target_path):
@@ -931,42 +961,54 @@ def build_demo(
             final_instruct,
             ns, gs, dn, sp, du, pp, po
         ):
-            if not final_instruct or not final_instruct.strip():
-                final_instruct = None
-            else:
-                final_instruct = final_instruct.strip()
+            try:
+                if not final_instruct or not final_instruct.strip():
+                    final_instruct = None
+                else:
+                    final_instruct = final_instruct.strip()
 
-            paths = _get_paths(r_aud)
-            n_audio = len(paths)
+                paths = _get_paths(r_aud)
+                n_audio = len(paths)
 
-            # 批量模式：多个音频文件
-            if n_audio > 1:
-                audio_out, status, preview, file_paths = _batch_gen_fn(
-                    model_name, text, lang,
-                    paths,
-                    r_txt,
-                    final_instruct,
-                    ns, gs, dn, sp, du, pp, po,
-                )
-                return (
-                    audio_out,
-                    status,
-                    preview,
-                    file_paths,
-                )
-            else:
-                # 单个模式（0 或 1 个参考音频）
-                single_path = paths[0] if paths else None
-                audio_out, status, saved = _gen(
+                # 批量模式：多个音频文件
+                if n_audio > 1:
+                    audio_out, status, preview, file_paths = _batch_gen_fn(
+                        model_name, text, lang,
+                        paths,
+                        r_txt,
+                        final_instruct,
+                        ns, gs, dn, sp, du, pp, po,
+                    )
+                    return (
+                        audio_out,
+                        status,
+                        preview,
+                        file_paths,
+                    )
+                else:
+                    # 单个模式（0 或 1 个参考音频）
+                    single_path = paths[0] if paths else None
+                    audio_out, status, saved = _gen(
+                        model_name,
+                        text,
+                        lang,
+                        single_path,
+                        final_instruct,
+                        ns, gs, dn, sp, du, pp, po,
+                        ref_text=r_txt or None,
+                    )
+                    return audio_out, status, saved, saved
+            except gr.Error:
+                raise  # _gen_core 已记录日志，直接透传
+            except Exception as e:
+                logging.error(
+                    "[顶层异常] 模型=%s 文本(前200字)=%s 异常: %s",
                     model_name,
-                    text,
-                    lang,
-                    single_path,
-                    final_instruct,
-                    ns, gs, dn, sp, du, pp, po,
-                    ref_text=r_txt or None,
+                    (text or "").strip()[:200],
+                    e,
+                    exc_info=True,
                 )
-                return audio_out, status, saved, saved
+                raise gr.Error(f"{type(e).__name__}: {e}")
 
         # --- 同步 State 的回调 ---
         ref_audio_single.change(
@@ -1096,10 +1138,29 @@ def build_demo(
 
 
 def main(argv=None) -> int:
+    log_file = os.path.abspath("omnivoice_demo.log")
+    _file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    _file_handler.setLevel(logging.ERROR)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            _file_handler,
+        ],
     )
+    logging.info("日志文件路径: %s", log_file)
+
+    # 兜底：捕获后台线程中未处理的异常并写入日志
+    def _thread_excepthook(args):
+        if args.exc_type is SystemExit:
+            return
+        logging.error(
+            "[线程未捕获异常] 线程=%s",
+            args.thread,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+    threading.excepthook = _thread_excepthook
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1150,7 +1211,30 @@ def main(argv=None) -> int:
     except Exception:
         pass
 
-    demo.queue(default_concurrency_limit=concurrency_limit).launch(
+    queued_demo = demo.queue(default_concurrency_limit=concurrency_limit)
+
+    # FastAPI 全局异常 handler：捕获序列化层以下的崩溃，避免前端收到无法解析的响应
+    try:
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        @queued_demo.app.exception_handler(Exception)
+        async def _global_exception_handler(request: Request, exc: Exception):
+            logging.error(
+                "[FastAPI全局异常] %s %s 异常: %s",
+                request.method,
+                request.url,
+                exc,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": f"{type(exc).__name__}: {exc}"},
+            )
+    except Exception:
+        logging.warning("无法注册 FastAPI 全局异常 handler，忽略。", exc_info=True)
+
+    queued_demo.launch(
         server_name=args.ip,
         server_port=args.port,
         share=args.share,

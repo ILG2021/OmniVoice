@@ -31,3 +31,4 @@ examples/exp*
 models_asr/
 models/
 gradio_tmp/
+omnivoice_demo.log
