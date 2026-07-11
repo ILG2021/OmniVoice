@@ -811,7 +811,8 @@ def build_demo(
                     type="filepath",
                     autoplay=True,
                     interactive=True,
-                    buttons=[],
+                    show_download_button=False,
+                    show_share_button=False,
                     sources=[],
                 )
             out_audio_path = gr.State(value=None)
