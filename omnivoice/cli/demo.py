@@ -511,13 +511,15 @@ def build_demo(
             f"spd{speed_label}.wav"
         )
         output_path = os.path.join(last_audio_path, filename)
-        sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_32")
+        sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_24")
         _elapsed = time.time() - _t0
         logging.info(
             "[推理完成] 模型=%s 耗时=%.2fs 输出=%s",
             model_name, _elapsed, output_path,
         )
-        return output_path, "完成。", output_path
+        # 返回 numpy 数组：音频随 SSE 消息直接内嵌传输到浏览器，
+        # 避免浏览器再通过 frp 发起第二次 HTTP GET 取音频文件。
+        return (output_sampling_rate, waveform), "完成。", output_path
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
@@ -546,7 +548,7 @@ def build_demo(
                     .numpy()
                 )
                 sample_rate = 48000
-            sf.write(target_path, data, sample_rate, subtype="PCM_32")
+            sf.write(target_path, data, sample_rate, subtype="PCM_16")
         except Exception as e:
             return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path, None
 
@@ -752,9 +754,10 @@ def build_demo(
             f"spd{speed_label}.wav"
         )
         merged_path = os.path.join(gen_dir, merged_fname)
-        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_32")
+        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_16")
 
-        return merged_path, status, merged_path, merged_path
+        # 返回 numpy 数组，同 _gen_core
+        return (output_sampling_rate, merged_audio), status, merged_path, merged_path
 
     # =====================================================================
     # UI
@@ -1212,6 +1215,21 @@ def main(argv=None) -> int:
         pass
 
     queued_demo = demo.queue(default_concurrency_limit=concurrency_limit)
+
+    # 禁用 frp / nginx 的响应缓冲，确保 SSE 事件实时到达浏览器
+    try:
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _NoBufferMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                response = await call_next(request)
+                response.headers["X-Accel-Buffering"] = "no"
+                return response
+
+        queued_demo.app.add_middleware(_NoBufferMiddleware)
+        logging.info("已注册 X-Accel-Buffering: no 中间件（frp/nginx 反向代理优化）")
+    except Exception:
+        logging.warning("无法注册反向代理缓冲中间件，忽略。", exc_info=True)
 
     # FastAPI 全局异常 handler：捕获序列化层以下的崩溃，避免前端收到无法解析的响应
     try:
