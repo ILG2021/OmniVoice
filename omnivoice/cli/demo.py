@@ -548,7 +548,7 @@ def build_demo(
                     .numpy()
                 )
                 sample_rate = 48000
-            sf.write(target_path, data, sample_rate, subtype="PCM_16")
+            sf.write(target_path, data, sample_rate, subtype="PCM_24")
         except Exception as e:
             return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path, None
 
@@ -754,7 +754,7 @@ def build_demo(
             f"spd{speed_label}.wav"
         )
         merged_path = os.path.join(gen_dir, merged_fname)
-        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_16")
+        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_24")
 
         # 返回 numpy 数组，同 _gen_core
         return (output_sampling_rate, merged_audio), status, merged_path, merged_path
