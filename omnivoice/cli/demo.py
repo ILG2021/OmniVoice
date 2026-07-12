@@ -115,10 +115,42 @@ _ATTR_INFO = {
     "中文方言": "仅对中文语音生效。",
 }
 
+# ---------------------------------------------------------------------------
+# MP3 encoding helper (pydub + system ffmpeg, avoids torchaudio ffmpeg backend)
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Model discovery and LRU cache
-# ---------------------------------------------------------------------------
+def _write_mp3(path: str, waveform: np.ndarray, sample_rate: int, bitrate: str = "192k") -> None:
+    """Save a float32 numpy waveform as MP3 using pydub (calls system ffmpeg).
+
+    Args:
+        path: Output .mp3 file path.
+        waveform: 1-D float32 numpy array, values in [-1, 1].
+        sample_rate: Sample rate in Hz.
+        bitrate: MP3 bitrate string, e.g. "192k".
+    """
+    import io
+    from pydub import AudioSegment
+    # Convert float32 [-1,1] → int16 PCM
+    pcm16 = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    sf.write(buf, pcm16, sample_rate, format="WAV", subtype="PCM_16")
+    buf.seek(0)
+    AudioSegment.from_wav(buf).export(path, format="mp3", bitrate=bitrate)
+
+
+def _load_audio_numpy(path: str):
+    """Load any audio file (WAV/MP3/…) → (waveform: (C,T) float32 numpy, sample_rate)."""
+    from pydub import AudioSegment
+    seg = AudioSegment.from_file(path)
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    samples /= 2 ** (seg.sample_width * 8 - 1)  # normalise to [-1, 1]
+    if seg.channels > 1:
+        data = samples.reshape(-1, seg.channels).T  # (C, T)
+    else:
+        data = samples[np.newaxis, :]               # (1, T)
+    return data, seg.frame_rate
+
+
 
 
 def _cleanup_torch_cache(device=None):
@@ -483,19 +515,8 @@ def build_demo(
                 model_cache.release(model_id)
             _cleanup_torch_cache(model_cache.device)
 
-        output_sampling_rate = 48000
-        waveform_float = audio[0]
-        if model.sampling_rate != output_sampling_rate:
-            waveform_float = (
-                torchaudio.functional.resample(
-                    torch.from_numpy(waveform_float).unsqueeze(0),
-                    orig_freq=model.sampling_rate,
-                    new_freq=output_sampling_rate,
-                )
-                .squeeze(0)
-                .numpy()
-            )
-        waveform = waveform_float.clip(-1.0, 1.0).astype(np.float32)
+        output_sampling_rate = model.sampling_rate
+        waveform = audio[0].clip(-1.0, 1.0).astype(np.float32)
         last_audio_path = "last_audio"
         os.makedirs(last_audio_path, exist_ok=True)
         if ref_audio:
@@ -508,47 +529,33 @@ def build_demo(
         filename = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}.wav"
+            f"spd{speed_label}.mp3"
         )
         output_path = os.path.join(last_audio_path, filename)
-        sf.write(output_path, waveform, output_sampling_rate, subtype="PCM_24")
+        _write_mp3(output_path, waveform, output_sampling_rate)
         _elapsed = time.time() - _t0
         logging.info(
             "[推理完成] 模型=%s 耗时=%.2fs 输出=%s",
             model_name, _elapsed, output_path,
         )
-        # 返回 numpy 数组：音频随 SSE 消息直接内嵌传输到浏览器，
-        # 避免浏览器再通过 frp 发起第二次 HTTP GET 取音频文件。
-        return (output_sampling_rate, waveform), "完成。", output_path
+        # 返回 filepath：浏览器单独 GET 该 MP3 文件，支持流式播放，
+        # 文件体积比 WAV 小约 75%，慢网络用户体验更佳。
+        return output_path, "完成。", output_path
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
             return None, "没有可保存的音频。", target_path, None
 
         if not target_path:
-            target_path = os.path.join("last_audio", "edited_audio.wav")
+            target_path = os.path.join("last_audio", "edited_audio.mp3")
 
         os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
 
         try:
-            data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
-            if sample_rate != 48000:
-                audio_tensor = torch.from_numpy(np.asarray(data, dtype=np.float32))
-                if audio_tensor.ndim == 1:
-                    audio_tensor = audio_tensor.unsqueeze(0)
-                else:
-                    audio_tensor = audio_tensor.T
-                data = (
-                    torchaudio.functional.resample(
-                        audio_tensor,
-                        orig_freq=sample_rate,
-                        new_freq=48000,
-                    )
-                    .T.squeeze()
-                    .numpy()
-                )
-                sample_rate = 48000
-            sf.write(target_path, data, sample_rate, subtype="PCM_24")
+            data, sample_rate = _load_audio_numpy(audio_path)  # (C, T) float32
+            # 取均值降为单声道再写 MP3
+            mono = data.mean(axis=0) if data.ndim == 2 else data.squeeze()
+            _write_mp3(target_path, mono, sample_rate)
         except Exception as e:
             return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path, None
 
@@ -662,7 +669,7 @@ def build_demo(
                 return ref_lines[0]
             return None
 
-        output_sampling_rate = 48000
+        output_sampling_rate = None  # 由各段实际采样率决定，拼接时统一
         gen_dir = "gen_audio"
         os.makedirs(gen_dir, exist_ok=True)
         delete_old_files_and_dirs(gen_dir, days=2)
@@ -685,7 +692,9 @@ def build_demo(
                 ref_text=_ref_text_for(i),
             )
             if saved_path and os.path.exists(saved_path):
-                shutil.copy2(saved_path, out_path)
+                # 用 pydub 解码 MP3 → 无损 WAV 落盘，避免后续拼接时二次 MP3 编码
+                from pydub import AudioSegment as _AS
+                _AS.from_file(saved_path).export(out_path, format="wav")
                 generated_paths.append(out_path)
             else:
                 errors.append(f"第 {i+1} 条失败：{status_msg}")
@@ -701,24 +710,20 @@ def build_demo(
         # --- 拼接所有生成音频为单文件 ---
         segments = []
         for p in generated_paths:
-            data, sr = sf.read(p, dtype="float32", always_2d=False)
-            if sr != output_sampling_rate:
-                t = torch.from_numpy(np.asarray(data, dtype=np.float32))
-                if t.ndim == 1:
-                    t = t.unsqueeze(0)
-                else:
-                    t = t.T
-                data = (
-                    torchaudio.functional.resample(t, orig_freq=sr, new_freq=output_sampling_rate)
-                    .T.squeeze()
-                    .numpy()
-                )
-            # 统一为 (1, T) 供 cross_fade_chunks 使用
+            data, sr = sf.read(p, dtype="float32", always_2d=False)  # WAV 中间文件直接用 soundfile
             if data.ndim == 1:
                 data = data[np.newaxis, :]   # (T,) → (1, T)
             elif data.ndim == 2:
                 data = data.T                # (T, C) → (C, T)
-            segments.append(data)
+            if output_sampling_rate is None:
+                output_sampling_rate = sr
+            elif sr != output_sampling_rate:
+                # 采样率不一致时重采样对齐（正常情况下不会触发）
+                t = torch.from_numpy(data)
+                data = torchaudio.functional.resample(
+                    t, orig_freq=sr, new_freq=output_sampling_rate
+                ).numpy()
+            segments.append(data)  # (C, T)
         # 拼接：加 0.5 s 静音区 + 交叉淡化
         merged_audio = cross_fade_chunks(
             segments,
@@ -737,7 +742,7 @@ def build_demo(
         ref_basename = "+".join(ref_stems) if ref_stems else "batch"
         # 先算出除 ref_basename 外的固定字节开销
         fixed = (
-            f"{_safe_filename_part(model_name)}----spd{speed_label}.wav"
+            f"{_safe_filename_part(model_name)}----spd{speed_label}.mp3"
         ).encode("utf-8")
         max_ref_bytes = _FNAME_MAX_BYTES - len(fixed)
         if len(ref_basename.encode("utf-8")) > max_ref_bytes:
@@ -751,13 +756,13 @@ def build_demo(
         merged_fname = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}.wav"
+            f"spd{speed_label}.mp3"
         )
         merged_path = os.path.join(gen_dir, merged_fname)
-        sf.write(merged_path, merged_audio, output_sampling_rate, subtype="PCM_24")
+        _write_mp3(merged_path, merged_audio, output_sampling_rate)
 
-        # 返回 numpy 数组，同 _gen_core
-        return (output_sampling_rate, merged_audio), status, merged_path, merged_path
+        # 返回 filepath，同 _gen_core
+        return merged_path, status, merged_path, merged_path
 
     # =====================================================================
     # UI
@@ -813,6 +818,7 @@ def build_demo(
                     label="合成结果",
                     type="filepath",
                     autoplay=True,
+                    format="mp3",
                     interactive=True,
                     show_download_button=False,
                     show_share_button=False,
@@ -925,7 +931,7 @@ def build_demo(
                     set_ns = gr.Slider(4, 64, value=32, step=1, label="推理步数", info="默认 32。")
                     set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
                 with gr.Row():
-                    set_dn = gr.Checkbox(label="降噪", value=True, info="默认关闭。")
+                    set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
                     set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 

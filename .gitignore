@@ -31,4 +31,6 @@ examples/exp*
 models_asr/
 models/
 gradio_tmp/
+gen_audio/
+last_audio/
 omnivoice_demo.log
