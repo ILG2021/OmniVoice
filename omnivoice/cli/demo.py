@@ -544,7 +544,7 @@ def build_demo(
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
-            return None, "没有可保存的音频。", target_path, None
+            return  "没有可保存的音频。", target_path, None
 
         if not target_path:
             target_path = os.path.join("last_audio", "edited_audio.mp3")
@@ -557,10 +557,9 @@ def build_demo(
             mono = data.mean(axis=0) if data.ndim == 2 else data.squeeze()
             _write_mp3(target_path, mono, sample_rate)
         except Exception as e:
-            return audio_path, f"保存失败：{type(e).__name__}: {e}", target_path, None
+            return  f"保存失败：{type(e).__name__}: {e}", target_path, None
 
         return (
-            target_path,
             f"已保存：{os.path.basename(target_path)}",
             target_path,
             target_path,
@@ -1134,7 +1133,7 @@ def build_demo(
         save_event = btn_save.click(
             _save_edited_audio,
             inputs=[out_audio, out_audio_path],
-            outputs=[out_audio, out_status, out_audio_path, download_file],
+            outputs=[ out_status, out_audio_path, download_file],
         )
         save_event.then(fn=None, js=auto_download_js, queue=False)
 
