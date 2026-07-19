@@ -662,7 +662,11 @@ class OmniVoice(PreTrainedModel):
                 0
             )  # (C, T)
 
-        if preprocess_prompt:
+        if preprocess_prompt and ref_text is not None:
+            # ``ref_text`` is optional: when it is omitted, the model can
+            # still clone the voice from the reference audio alone.  Keep
+            # ``None`` here so callers can distinguish that case from an
+            # explicitly empty transcript.
             ref_text = add_punctuation(ref_text)
 
         return VoiceClonePrompt(
