@@ -35,7 +35,7 @@ import re
 import threading
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -578,6 +578,7 @@ class OmniVoice(PreTrainedModel):
         ref_audio: Union[str, tuple[torch.Tensor, int]],
         ref_text: Optional[str] = None,
         preprocess_prompt: bool = True,
+        transcribe_fn: Optional[Callable[[tuple[np.ndarray, int]], str]] = None,
     ) -> VoiceClonePrompt:
         """Create a reusable voice clone prompt from reference audio.
 
@@ -588,6 +589,8 @@ class OmniVoice(PreTrainedModel):
             preprocess_prompt: If ``True`` (default), apply silence removal and
                 trimming to the reference audio, add punctuation in the end
                 of reference text (if not already)
+            transcribe_fn: Optional ASR callback. When ``ref_text`` is omitted,
+                it receives the preprocessed ``(waveform, sample_rate)`` tuple.
 
         Returns:
             A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
@@ -649,6 +652,12 @@ class OmniVoice(PreTrainedModel):
                 "quality. We recommend trimming it to 3-10s.",
                 ref_duration,
             )
+
+        # Match the original inference order: transcribe the reference only
+        # after normalization, trimming, and silence removal.
+        if ref_text is None and transcribe_fn is not None:
+            ref_text = transcribe_fn((ref_wav, self.sampling_rate))
+            logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.shape[-1] % chunk_size)

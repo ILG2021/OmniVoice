@@ -30,7 +30,8 @@ import gc
 import logging
 import os
 import threading
-from typing import Any, Callable, Dict, List
+import uuid
+from typing import Any, Callable, Dict, List, Optional
 
 # Set Gradio temp directory to a local folder to avoid tmpfs RAM consumption on Linux
 if "GRADIO_TEMP_DIR" not in os.environ:
@@ -52,7 +53,6 @@ import torchaudio
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
-from omnivoice.utils import asr_sherpaonnx
 from omnivoice.utils.audio import cross_fade_chunks
 
 # ---------------------------------------------------------------------------
@@ -60,6 +60,14 @@ from omnivoice.utils.audio import cross_fade_chunks
 # ---------------------------------------------------------------------------
 _AUTO_LABEL = "自动"
 _ALL_LANGUAGES = [_AUTO_LABEL] + sorted(lang_display_name(n) for n in LANG_NAMES)
+
+_WHISPER_ASR_PIPE = None
+_WHISPER_ASR_CONFIG = None
+_WHISPER_ASR_LOCK = threading.Lock()
+_ASR_BACKEND_CHOICES = [
+    ("Whisper（默认，效果更好）", "whisper"),
+    ("Sherpa（快速）", "sherpa"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -116,26 +124,29 @@ _ATTR_INFO = {
 }
 
 # ---------------------------------------------------------------------------
-# MP3 encoding helper (pydub + system ffmpeg, avoids torchaudio ffmpeg backend)
+# Lossless WAV output helper
 # ---------------------------------------------------------------------------
 
-def _write_mp3(path: str, waveform: np.ndarray, sample_rate: int, bitrate: str = "192k") -> None:
-    """Save a float32 numpy waveform as MP3 using pydub (calls system ffmpeg).
+def _to_pcm16(waveform: np.ndarray) -> np.ndarray:
+    """Convert a waveform using the exact expression from the original demo."""
+    return (waveform * 32767).astype(np.int16)
+
+
+def _write_wav(path: str, waveform: np.ndarray, sample_rate: int) -> None:
+    """Save a waveform as 16-bit PCM WAV, matching the original demo output.
 
     Args:
-        path: Output .mp3 file path.
-        waveform: 1-D float32 numpy array, values in [-1, 1].
+        path: Output .wav file path.
+        waveform: 1-D numpy waveform.
         sample_rate: Sample rate in Hz.
-        bitrate: MP3 bitrate string, e.g. "192k".
     """
-    import io
-    from pydub import AudioSegment
-    # Convert float32 [-1,1] → int16 PCM
-    pcm16 = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    sf.write(buf, pcm16, sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    AudioSegment.from_wav(buf).export(path, format="mp3", bitrate=bitrate)
+    pcm16 = _to_pcm16(waveform)
+    sf.write(path, pcm16, sample_rate, format="WAV", subtype="PCM_16")
+
+
+def _random_file_suffix() -> str:
+    """Return a short random suffix so every generated audio URL is unique."""
+    return uuid.uuid4().hex[:8]
 
 
 def _load_audio_numpy(path: str):
@@ -337,34 +348,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--share", action="store_true", default=False, help="Create public link."
     )
     parser.add_argument(
-        "--no-asr",
-        action="store_true",
-        default=False,
-        help="Skip loading ASR model. Reference text auto-transcription"
-        " will be unavailable.",
-    )
-    parser.add_argument(
-        "--asr-backend",
-        choices=["sherpa", "whisper"],
-        default="sherpa",
-        help="ASR backend for reference audio transcription (default: sherpa).",
-    )
-    parser.add_argument(
-        "--asr-model",
-        default=None,
-        help=(
-            "ASR model path or HuggingFace repo id. Defaults to "
-            "csukuangfj/sherpa-onnx-paraformer-zh-2023-09-14 for sherpa, "
-            "or openai/whisper-large-v3-turbo for whisper."
-        ),
-    )
-    parser.add_argument(
-        "--asr-threads",
-        type=int,
-        default=8,
-        help="CPU threads used by sherpa-onnx ASR (default: 8).",
-    )
-    parser.add_argument(
         "--concurrency",
         "-C",
         type=int,
@@ -375,6 +358,92 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _build_asr_transcriber(
+    backend: str,
+    model_name: Optional[str],
+    device,
+    num_threads: int,
+) -> tuple[Callable[[str, bool], str], Optional[float]]:
+    """Create the selected reference-audio transcription backend.
+
+    Returns the transcription callable and the upload-duration limit. Both
+    backends reject reference audio longer than 15 seconds before model loading
+    or transcription, preventing oversized uploads from blocking the ASR queue.
+    """
+    backend = backend.lower().strip()
+    if backend == "sherpa":
+        from omnivoice.utils import asr_sherpaonnx
+
+        configured = False
+        configure_lock = threading.Lock()
+
+        def _transcribe_sherpa(audio, add_punctuation: bool = False) -> str:
+            nonlocal configured
+            if not configured:
+                with configure_lock:
+                    if not configured:
+                        logging.info("Loading Sherpa ASR model on first use ...")
+                        asr_sherpaonnx.configure(
+                            model_name=model_name,
+                            num_threads=max(1, int(num_threads)),
+                        )
+                        configured = True
+                        logging.info("Sherpa ASR model loaded and kept resident.")
+            return asr_sherpaonnx.transcribe(audio, add_punctuation)
+
+        return _transcribe_sherpa, 15.0
+
+    if backend == "whisper":
+        whisper_model = model_name or "openai/whisper-large-v3-turbo"
+        whisper_config = (whisper_model, str(device))
+
+        def _transcribe_whisper(audio, add_punctuation: bool = False) -> str:
+            global _WHISPER_ASR_PIPE, _WHISPER_ASR_CONFIG
+
+            # Whisper returns its own punctuation, matching the former ASR path.
+            del add_punctuation
+            with _WHISPER_ASR_LOCK:
+                if (
+                    _WHISPER_ASR_PIPE is None
+                    or _WHISPER_ASR_CONFIG != whisper_config
+                ):
+                    from transformers import pipeline as hf_pipeline
+
+                    asr_dtype = (
+                        torch.float16
+                        if str(device).startswith(("cuda", "xpu"))
+                        else torch.float32
+                    )
+                    logging.info(
+                        "Loading Whisper ASR model %s on %s on first use ...",
+                        whisper_model,
+                        device,
+                    )
+                    _WHISPER_ASR_PIPE = hf_pipeline(
+                        "automatic-speech-recognition",
+                        model=whisper_model,
+                        dtype=asr_dtype,
+                        device_map=device,
+                    )
+                    _WHISPER_ASR_CONFIG = whisper_config
+                    logging.info("Whisper ASR model loaded and kept resident.")
+                if isinstance(audio, tuple):
+                    waveform, sample_rate = audio
+                    if isinstance(waveform, torch.Tensor):
+                        waveform = waveform.detach().cpu().numpy()
+                    audio_input = {
+                        "array": np.squeeze(np.asarray(waveform)),
+                        "sampling_rate": sample_rate,
+                    }
+                else:
+                    audio_input = audio
+                return _WHISPER_ASR_PIPE(audio_input)["text"].strip()
+
+        return _transcribe_whisper, 15.0
+
+    raise ValueError(f"Unsupported ASR backend: {backend}")
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +485,27 @@ def build_demo(
     model_choices: dict[str, str],
     generate_fn=None,
     concurrency_limit: int = 1,
+    asr_transcribers: Optional[Dict[str, Callable[[Any, bool], str]]] = None,
+    default_asr_backend: str = "whisper",
+    asr_max_duration: Optional[float] = 15.0,
 ) -> gr.Blocks:
 
     infer_semaphore = threading.BoundedSemaphore(max(1, int(concurrency_limit)))
     default_model_name = next(iter(model_choices))
+    asr_transcribers = asr_transcribers or {}
+
+    def _validate_ref_audio_duration(audio_path: Optional[str]) -> None:
+        if not audio_path or asr_max_duration is None:
+            return
+        try:
+            duration = sf.info(audio_path).duration
+        except Exception:
+            return
+        if duration > asr_max_duration:
+            raise gr.Error(
+                f"参考音频过长（{duration:.1f}s > {asr_max_duration:g}s），"
+                "请上传更短的参考音频。"
+            )
 
     # -- shared generation core --
     def _gen_core(
@@ -436,6 +522,8 @@ def build_demo(
         preprocess_prompt,
         postprocess_output,
         ref_text=None,
+        asr_backend="whisper",
+        add_ref_punctuation=False,
     ):
         delete_old_files_and_dirs("./gen_audio", days=2)
         delete_old_files_and_dirs("./last_audio", days=2)
@@ -445,9 +533,10 @@ def build_demo(
         model_id = model_choices.get(model_name)
         if model_id is None:
             logging.warning("[推理] 未知模型：%s", model_name)
-            return None, f"未知模型：{model_name}", None
+            return None, f"未知模型：{model_name}", None, ref_text
         if not text or not text.strip():
-            return None, "请输入要合成的文本。", None
+            return None, "请输入要合成的文本。", None, ref_text
+        _validate_ref_audio_duration(ref_audio)
 
         # ---- 记录推理请求 ----
         logging.info(
@@ -484,17 +573,34 @@ def build_demo(
             kw["duration"] = float(duration)
 
         acquired = False
+        resolved_ref_text = ref_text
         _t0 = time.time()
         try:
             with infer_semaphore, torch.inference_mode():
                 model = model_cache.acquire(model_id)
                 acquired = True
                 if ref_audio:
-                    kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+                    transcribe_fn = None
+                    if ref_text is None:
+                        backend_transcriber = asr_transcribers.get(asr_backend)
+                        if backend_transcriber is None:
+                            raise ValueError(f"未知的转录模型：{asr_backend}")
+
+                        def transcribe_fn(audio):
+                            return backend_transcriber(
+                                audio, bool(add_ref_punctuation)
+                            )
+
+                    voice_clone_prompt = model.create_voice_clone_prompt(
                         ref_audio=ref_audio,
                         ref_text=ref_text,
                         preprocess_prompt=preprocess_prompt,
+                        transcribe_fn=transcribe_fn,
                     )
+                    kw["voice_clone_prompt"] = voice_clone_prompt
+                    # Return the exact text used by the inference prompt,
+                    # including ASR output and punctuation added in preprocessing.
+                    resolved_ref_text = voice_clone_prompt.ref_text
 
                 if instruct and instruct.strip():
                     kw["instruct"] = instruct.strip()
@@ -516,7 +622,7 @@ def build_demo(
             _cleanup_torch_cache(model_cache.device)
 
         output_sampling_rate = model.sampling_rate
-        waveform = audio[0].clip(-1.0, 1.0).astype(np.float32)
+        waveform = audio[0]
         last_audio_path = "last_audio"
         os.makedirs(last_audio_path, exist_ok=True)
         if ref_audio:
@@ -529,33 +635,42 @@ def build_demo(
         filename = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}.mp3"
+            f"spd{speed_label}--{_random_file_suffix()}.wav"
         )
         output_path = os.path.join(last_audio_path, filename)
-        _write_mp3(output_path, waveform, output_sampling_rate)
+        _write_wav(output_path, waveform, output_sampling_rate)
         _elapsed = time.time() - _t0
         logging.info(
             "[推理完成] 模型=%s 耗时=%.2fs 输出=%s",
             model_name, _elapsed, output_path,
         )
-        # 返回 filepath：浏览器单独 GET 该 MP3 文件，支持流式播放，
-        # 文件体积比 WAV 小约 75%，慢网络用户体验更佳。
-        return output_path, "完成。", output_path
+        # Return the lossless PCM16 WAV for playback and download.
+        return output_path, "完成。", output_path, resolved_ref_text
 
     def _save_edited_audio(audio_path, target_path):
         if not audio_path:
             return  "没有可保存的音频。", target_path, None
 
         if not target_path:
-            target_path = os.path.join("last_audio", "edited_audio.mp3")
+            target_path = os.path.join("last_audio", "edited_audio.wav")
+        elif os.path.splitext(target_path)[1].lower() != ".wav":
+            target_path = os.path.splitext(target_path)[0] + ".wav"
 
         os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
 
         try:
-            data, sample_rate = _load_audio_numpy(audio_path)  # (C, T) float32
-            # 取均值降为单声道再写 MP3
+            if (
+                os.path.abspath(audio_path) == os.path.abspath(target_path)
+                and os.path.exists(target_path)
+            ):
+                return (
+                    f"已保存：{os.path.basename(target_path)}",
+                    target_path,
+                    target_path,
+                )
+            data, sample_rate = _load_audio_numpy(audio_path)
             mono = data.mean(axis=0) if data.ndim == 2 else data.squeeze()
-            _write_mp3(target_path, mono, sample_rate)
+            _write_wav(target_path, mono, sample_rate)
         except Exception as e:
             return  f"保存失败：{type(e).__name__}: {e}", target_path, None
 
@@ -564,56 +679,6 @@ def build_demo(
             target_path,
             target_path,
         )
-
-    def _transcribe_one(audio_path: str, add_punctuation: bool) -> str:
-        """转录单个音频，返回文本字符串（失败时返回空串）"""
-        MAX_REF_AUDIO_DURATION = 15
-        if not audio_path or not os.path.exists(audio_path):
-            return ""
-        try:
-            info = sf.info(audio_path)
-            if info.duration > MAX_REF_AUDIO_DURATION:
-                gr.Warning(f"{os.path.basename(audio_path)} 过长（{info.duration:.1f}s > {MAX_REF_AUDIO_DURATION}s），已跳过转录")
-                return ""
-        except Exception:
-            pass
-        try:
-            return asr_sherpaonnx.transcribe(audio_path, add_punctuation=bool(add_punctuation))
-        except Exception as e:
-            gr.Warning(f"{os.path.basename(audio_path)} 转录失败：{e}")
-            return ""
-
-    def _transcribe_ref_audios(audio_files, add_punctuation):
-        """批量转录：支持单个或多个参考音频文件。
-        audio_files: None | str | list[str] — gr.File 返回的路径或路径列表
-        """
-        if not audio_files:
-            return gr.update(), "请上传参考音频。"
-
-        # 统一为列表
-        if isinstance(audio_files, str):
-            paths = [audio_files]
-        elif isinstance(audio_files, dict):          # gr.File 单文件有时返回 dict
-            paths = [audio_files.get("name", "") or audio_files.get("path", "")]
-        else:
-            paths = [
-                (f.get("name") or f.get("path") if isinstance(f, dict) else f)
-                for f in audio_files
-            ]
-        paths = [p for p in paths if p]
-
-        if not paths:
-            return gr.update(), "请上传参考音频。"
-
-        results = [_transcribe_one(p, add_punctuation) for p in paths]
-
-        if len(results) == 1:
-            status = "参考音频已转录，可直接修改参考文本。"
-        else:
-            status = f"已批量转录 {len(results)} 个参考音频，每行对应一个音频的文本。"
-
-        combined = "\n".join(results)
-        return gr.update(value=combined), status
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -624,6 +689,7 @@ def build_demo(
         ref_text_block,
         final_instruct,
         ns, gs, dn, sp, du, pp, po,
+        asr_backend, add_ref_punctuation,
     ):
         """批量生成：每行 text 对应一个参考音频文件，检查数量一致后逐条生成，拼接为单个音频文件输出。"""
         # --- 解析文件列表 ---
@@ -644,7 +710,7 @@ def build_demo(
         lines = [l for l in (text or "").splitlines() if l.strip()]
 
         if not lines:
-            return None, "请输入要合成的文本（每行一条）。", None, None
+            return None, "请输入要合成的文本（每行一条）。", None, None, ref_text_block
 
         n_audio = len(paths)
         n_lines = len(lines)
@@ -656,7 +722,7 @@ def build_demo(
                 f"请确保每行文本对应一个参考音频（共 {n_audio} 行）。"
             )
             gr.Warning(msg)
-            return None, msg, None, None
+            return None, msg, None, None, ref_text_block
 
         # --- 解析参考文本行（可为空） ---
         ref_lines = [l for l in (ref_text_block or "").splitlines() if l.strip()]
@@ -672,16 +738,21 @@ def build_demo(
         gen_dir = "gen_audio"
         os.makedirs(gen_dir, exist_ok=True)
         delete_old_files_and_dirs(gen_dir, days=2)
+        batch_suffix = _random_file_suffix()
 
         generated_paths: List[str] = []
+        resolved_ref_texts: List[str] = []
         errors: List[str] = []
 
         for i, (line_text, ref_path) in enumerate(zip(lines, paths if paths else [None] * n_lines)):
             ref_basename = os.path.basename(ref_path).rpartition(".")[0] if ref_path else "auto"
-            fname = f"{i+1:03d}__{_safe_filename_part(ref_basename)}.wav"
+            fname = (
+                f"{i+1:03d}__{_safe_filename_part(ref_basename)}--"
+                f"{batch_suffix}.wav"
+            )
             out_path = os.path.join(gen_dir, fname)
 
-            _, status_msg, saved_path = _gen(
+            _, status_msg, saved_path, resolved_ref_text = _gen(
                 model_name,
                 line_text,
                 language,
@@ -689,17 +760,26 @@ def build_demo(
                 final_instruct,
                 ns, gs, dn, sp, du, pp, po,
                 ref_text=_ref_text_for(i),
+                asr_backend=asr_backend,
+                add_ref_punctuation=add_ref_punctuation,
             )
+            resolved_ref_texts.append(resolved_ref_text or "")
             if saved_path and os.path.exists(saved_path):
-                # 用 pydub 解码 MP3 → 无损 WAV 落盘，避免后续拼接时二次 MP3 编码
-                from pydub import AudioSegment as _AS
-                _AS.from_file(saved_path).export(out_path, format="wav")
+                # The single-item path is already PCM WAV; copy it without
+                # decoding or re-encoding before concatenation.
+                shutil.copyfile(saved_path, out_path)
                 generated_paths.append(out_path)
             else:
                 errors.append(f"第 {i+1} 条失败：{status_msg}")
 
         if not generated_paths:
-            return None, "批量生成全部失败：\n" + "\n".join(errors), None, None
+            return (
+                None,
+                "批量生成全部失败：\n" + "\n".join(errors),
+                None,
+                None,
+                "\n".join(resolved_ref_texts),
+            )
 
         status = f"批量生成完成，共 {len(generated_paths)} 条"
         if errors:
@@ -741,7 +821,8 @@ def build_demo(
         ref_basename = "+".join(ref_stems) if ref_stems else "batch"
         # 先算出除 ref_basename 外的固定字节开销
         fixed = (
-            f"{_safe_filename_part(model_name)}----spd{speed_label}.mp3"
+            f"{_safe_filename_part(model_name)}----spd{speed_label}--"
+            f"{batch_suffix}.wav"
         ).encode("utf-8")
         max_ref_bytes = _FNAME_MAX_BYTES - len(fixed)
         if len(ref_basename.encode("utf-8")) > max_ref_bytes:
@@ -755,13 +836,18 @@ def build_demo(
         merged_fname = (
             f"{_safe_filename_part(model_name)}--"
             f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}.mp3"
+            f"spd{speed_label}--{batch_suffix}.wav"
         )
         merged_path = os.path.join(gen_dir, merged_fname)
-        _write_mp3(merged_path, merged_audio, output_sampling_rate)
+        _write_wav(merged_path, merged_audio, output_sampling_rate)
 
-        # 返回 filepath，同 _gen_core
-        return merged_path, status, merged_path, merged_path
+        return (
+            merged_path,
+            status,
+            merged_path,
+            merged_path,
+            "\n".join(resolved_ref_texts),
+        )
 
     # =====================================================================
     # UI
@@ -817,7 +903,7 @@ def build_demo(
                     label="合成结果",
                     type="filepath",
                     autoplay=True,
-                    format="mp3",
+                    format="wav",
                     interactive=True,
                     show_download_button=False,
                     show_share_button=False,
@@ -864,8 +950,15 @@ def build_demo(
                 set_sp = gr.Slider(
                     0.5, 1.5, value=1.0, step=0.05, label="语速", info="1.0 为正常语速，大于 1 更快，小于 1 更慢。"
                 )
+                asr_backend_select = gr.Dropdown(
+                    label="参考音频转录模型",
+                    choices=_ASR_BACKEND_CHOICES,
+                    value=default_asr_backend,
+                    allow_custom_value=False,
+                    interactive=True,
+                )
                 ref_punctuation = gr.Checkbox(
-                    label="自动参考文本包含标点",
+                    label="sherpa参考文本包含标点",
                     value=False,
                 )
                         
@@ -930,7 +1023,7 @@ def build_demo(
                     set_ns = gr.Slider(4, 64, value=32, step=1, label="推理步数", info="默认 32。")
                     set_gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="引导强度（CFG）", info="默认 2.0。")
                 with gr.Row():
-                    set_dn = gr.Checkbox(label="降噪", value=False, info="默认关闭。")
+                    set_dn = gr.Checkbox(label="降噪", value=True, info="默认开启。")
                     set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 
@@ -956,18 +1049,19 @@ def build_demo(
 
         def _sync_single(path):
             """gr.Audio 单文件上传/录音 → 更新 merged_ref_audio State。"""
-            return [path] if path else None
+            return ([path] if path else None), gr.update(value="")
 
         def _sync_multi(files):
             """gr.File 多文件上传 → 更新 merged_ref_audio State。"""
             paths = _get_paths(files)
-            return paths if paths else None
+            return (paths if paths else None), gr.update(value="")
 
         def _unified_fn(
             model_name, text, lang,
             r_aud, r_txt,
             final_instruct,
-            ns, gs, dn, sp, du, pp, po
+            ns, gs, dn, sp, du, pp, po,
+            asr_backend, add_ref_punctuation,
         ):
             try:
                 if not final_instruct or not final_instruct.strip():
@@ -980,23 +1074,25 @@ def build_demo(
 
                 # 批量模式：多个音频文件
                 if n_audio > 1:
-                    audio_out, status, preview, file_paths = _batch_gen_fn(
+                    audio_out, status, preview, file_paths, resolved_ref_text = _batch_gen_fn(
                         model_name, text, lang,
                         paths,
                         r_txt,
                         final_instruct,
                         ns, gs, dn, sp, du, pp, po,
+                        asr_backend, add_ref_punctuation,
                     )
                     return (
                         audio_out,
                         status,
                         preview,
                         file_paths,
+                        resolved_ref_text,
                     )
                 else:
                     # 单个模式（0 或 1 个参考音频）
                     single_path = paths[0] if paths else None
-                    audio_out, status, saved = _gen(
+                    audio_out, status, saved, resolved_ref_text = _gen(
                         model_name,
                         text,
                         lang,
@@ -1004,8 +1100,10 @@ def build_demo(
                         final_instruct,
                         ns, gs, dn, sp, du, pp, po,
                         ref_text=r_txt or None,
+                        asr_backend=asr_backend,
+                        add_ref_punctuation=add_ref_punctuation,
                     )
-                    return audio_out, status, saved, saved
+                    return audio_out, status, saved, saved, resolved_ref_text
             except gr.Error:
                 raise  # _gen_core 已记录日志，直接透传
             except Exception as e:
@@ -1022,13 +1120,13 @@ def build_demo(
         ref_audio_single.change(
             _sync_single,
             inputs=[ref_audio_single],
-            outputs=[merged_ref_audio],
+            outputs=[merged_ref_audio, ref_text],
             queue=False,
         )
         ref_audio_multi.upload(
             _sync_multi,
             inputs=[ref_audio_multi],
-            outputs=[merged_ref_audio],
+            outputs=[merged_ref_audio, ref_text],
             queue=False,
         )
         ref_audio_multi.clear(
@@ -1053,29 +1151,12 @@ def build_demo(
                 set_du,
                 set_pp,
                 set_po,
+                asr_backend_select,
+                ref_punctuation,
             ],
-            outputs=[out_audio, out_status, out_audio_path, download_file],
+            outputs=[out_audio, out_status, out_audio_path, download_file, ref_text],
             concurrency_id="gpu_infer",
             concurrency_limit=concurrency_limit,
-        )
-        # 单文件上传/录音 → 自动转录（清除时跳过）
-        ref_audio_single.change(
-            lambda path, punct: (
-                _transcribe_ref_audios([path], punct) if path
-                else (gr.update(value=""), gr.update())
-            ),
-            inputs=[ref_audio_single, ref_punctuation],
-            outputs=[ref_text, out_status],
-            concurrency_id="asr",
-            concurrency_limit=4,
-        )
-        # 多文件上传 → 自动转录
-        ref_audio_multi.upload(
-            _transcribe_ref_audios,
-            inputs=[ref_audio_multi, ref_punctuation],
-            outputs=[ref_text, out_status],
-            concurrency_id="asr",
-            concurrency_limit=4,
         )
         ref_punctuation.change(
             fn=None,
@@ -1093,25 +1174,9 @@ def build_demo(
             """,
             queue=False,
         )
-        set_dn.change(
-            fn=None,
-            inputs=[set_dn],
-            js="""
-            (value) => {
-                try {
-                    localStorage.setItem(
-                        "omnivoice_set_dn",
-                        value ? "true" : "false"
-                    );
-                } catch (e) {}
-                return [];
-            }
-            """,
-            queue=False,
-        )
         demo.load(
             fn=None,
-            outputs=[ref_punctuation, set_dn],
+            outputs=[ref_punctuation],
             js="""
             () => {
                 try {
@@ -1119,12 +1184,9 @@ def build_demo(
                         localStorage.getItem(
                             "omnivoice_ref_text_add_punctuation"
                         ) === "true",
-                        localStorage.getItem(
-                            "omnivoice_set_dn"
-                        ) === "true"
                     ];
                 } catch (e) {
-                    return [false, false];
+                    return [false];
                 }
             }
             """,
@@ -1174,6 +1236,20 @@ def main(argv=None) -> int:
 
     device = args.device or get_best_device()
 
+    asr_transcribers = {}
+    for backend in ("whisper", "sherpa"):
+        transcribe_fn, backend_limit = _build_asr_transcriber(
+            backend=backend,
+            model_name=None,
+            device=device,
+            num_threads=8,
+        )
+        asr_transcribers[backend] = transcribe_fn
+        if backend_limit != 15.0:
+            raise RuntimeError(f"Unexpected ASR duration limit for {backend}")
+    asr_max_duration = 15.0
+    logging.info("Initial reference-audio ASR backend: whisper")
+
     fallback_model = args.model
     if not fallback_model:
         parser.print_help()
@@ -1206,6 +1282,9 @@ def main(argv=None) -> int:
         model_cache,
         model_choices,
         concurrency_limit=concurrency_limit,
+        asr_transcribers=asr_transcribers,
+        default_asr_backend="whisper",
+        asr_max_duration=asr_max_duration,
     )
 
     import tempfile

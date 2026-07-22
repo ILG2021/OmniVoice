@@ -122,6 +122,13 @@ Try OmniVoice without coding:
 
 - Launch the local web UI: `omnivoice-demo --ip 127.0.0.1 --port 8001`
 
+  The web UI provides a reference-audio transcription selector. Whisper is
+  selected by default, while Sherpa is available as the faster option. Sherpa
+  models are discovered automatically under `models_asr/`. Each ASR model is
+  loaded on its first generation request and remains resident afterward.
+  Automatic transcription runs after reference-audio preprocessing.
+  Reference audio longer than 15 seconds is rejected before ASR processing.
+
 - Or try it directly on [HuggingFace Space](https://huggingface.co/spaces/k2-fsa/OmniVoice)
 
 - Or run it in Google Colab: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/k2-fsa/OmniVoice/blob/master/docs/OmniVoice.ipynb)
