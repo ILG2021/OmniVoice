@@ -23,6 +23,7 @@ from omnivoice.models.omnivoice import (
     OmniVoice,
     OmniVoiceConfig,
     OmniVoiceGenerationConfig,
+    seed_gumbel,
 )
 
-__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig"]
+__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig", "seed_gumbel"]

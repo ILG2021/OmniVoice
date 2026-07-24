@@ -85,6 +85,50 @@ logger = logging.getLogger(__name__)
 _AUDIO_TOKENIZER_CACHE_LOCK = threading.Lock()
 _AUDIO_TOKENIZER_CACHE: dict[tuple[str, str], tuple[Any, Any, int, threading.Lock]] = {}
 
+# ---------------------------------------------------------------------------
+# Isolated Gumbel RNG — thread-local, so every inference thread gets its
+# own independent Generator.  This means:
+#   • External operations (ASR, tokenizer encode, …) cannot pollute the
+#     random state seen by _gumbel_sample.
+#   • Concurrent multi-user requests never share or corrupt each other's
+#     Generator state.
+# ---------------------------------------------------------------------------
+_GUMBEL_TLS = threading.local()  # thread-local storage for per-thread generators
+
+
+def _get_gumbel_generator() -> torch.Generator:
+    """Return the calling thread's private Gumbel Generator, creating it on first use."""
+    if not hasattr(_GUMBEL_TLS, "generator"):
+        g = torch.Generator()
+        g.seed()  # seed from OS entropy — each thread starts independently
+        _GUMBEL_TLS.generator = g
+    return _GUMBEL_TLS.generator
+
+
+def seed_gumbel(seed: Optional[int] = None) -> int:
+    """Re-seed the **current thread's** Gumbel Generator.
+
+    Use this to reproduce a specific draw (pass an integer seed) or to
+    request a brand-new random draw (pass ``None``, the default).
+
+    In a multi-user server each request runs in its own thread, so calling
+    ``seed_gumbel()`` only affects the current request and never interferes
+    with other concurrent requests.
+
+    Args:
+        seed: Integer seed.  ``None`` draws a fresh seed from OS entropy.
+
+    Returns:
+        The seed that was actually used.
+    """
+    g = _get_gumbel_generator()
+    if seed is None:
+        actual = g.seed()
+    else:
+        g.manual_seed(seed)
+        actual = seed
+    return actual
+
 
 def _get_shared_audio_tokenizer(device):
     audio_tokenizer_path = os.path.join(
@@ -1480,8 +1524,23 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
 
 
 def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Gumbel-max trick using a thread-local isolated Generator.
+
+    Each calling thread has its own ``torch.Generator`` (via
+    ``_get_gumbel_generator()``), so:
+    - External operations (ASR, tokenizer encode, …) cannot corrupt the
+      random state seen here.
+    - Concurrent multi-user requests are fully independent.
+    """
     scaled_logits = logits / temperature
-    u = torch.rand_like(scaled_logits)
+    # CPU generator cannot write directly to a CUDA tensor, so generate on
+    # CPU first and move to the target device.
+    # u = torch.rand_like(scaled_logits)
+    u = torch.rand(
+        scaled_logits.shape,
+        generator=_get_gumbel_generator(),
+        dtype=scaled_logits.dtype,
+    ).to(logits.device)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 
