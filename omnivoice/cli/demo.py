@@ -488,6 +488,7 @@ def build_demo(
     asr_transcribers: Optional[Dict[str, Callable[[Any, bool], str]]] = None,
     default_asr_backend: str = "whisper",
     asr_max_duration: Optional[float] = 15.0,
+    position_temperature: float = 5.0,
 ) -> gr.Blocks:
 
     infer_semaphore = threading.BoundedSemaphore(max(1, int(concurrency_limit)))
@@ -521,6 +522,7 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
+        position_temperature_value,
         ref_text=None,
         asr_backend="whisper",
         add_ref_punctuation=False,
@@ -556,6 +558,7 @@ def build_demo(
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
             guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
+            position_temperature=float(position_temperature_value),
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
@@ -680,8 +683,20 @@ def build_demo(
             target_path,
         )
 
-    # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
-    _gen = generate_fn if generate_fn is not None else _gen_core
+    # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces). The UI-only
+    # temperature argument is consumed here so existing wrappers keep their
+    # original callback signature.
+    if generate_fn is not None:
+        def _gen(*args, position_temperature_value, **kwargs):
+            del position_temperature_value
+            return generate_fn(*args, **kwargs)
+    else:
+        def _gen(*args, position_temperature_value, **kwargs):
+            return _gen_core(
+                *args,
+                position_temperature_value=position_temperature_value,
+                **kwargs,
+            )
 
     def _batch_gen_fn(
         model_name, text, language,
@@ -689,6 +704,7 @@ def build_demo(
         ref_text_block,
         final_instruct,
         ns, gs, dn, sp, du, pp, po,
+        position_temperature_value,
         asr_backend, add_ref_punctuation,
     ):
         """批量生成：每行 text 对应一个参考音频文件，检查数量一致后逐条生成，拼接为单个音频文件输出。"""
@@ -759,6 +775,7 @@ def build_demo(
                 ref_path,
                 final_instruct,
                 ns, gs, dn, sp, du, pp, po,
+                position_temperature_value=position_temperature_value,
                 ref_text=_ref_text_for(i),
                 asr_backend=asr_backend,
                 add_ref_punctuation=add_ref_punctuation,
@@ -1025,6 +1042,14 @@ def build_demo(
                     set_pp = gr.Checkbox(label="预处理参考音频", value=True, info="静音移除、裁剪、补充标点。")
                     set_po = gr.Checkbox(label="后处理输出音频", value=True, info="移除长静音。")
 
+                set_pt = gr.Slider(
+                    0.0,
+                    10.0,
+                    value=float(position_temperature),
+                    step=0.1,
+                    label="温度值",
+                    info="值越大越随机.",
+                )
 
         def _get_paths(audio_files):
             """统一解析 gr.Audio / gr.File 返回值为路径列表。"""
@@ -1059,6 +1084,7 @@ def build_demo(
             r_aud, r_txt,
             final_instruct,
             ns, gs, dn, sp, du, pp, po,
+            position_temperature_value,
             asr_backend, add_ref_punctuation,
         ):
             try:
@@ -1078,6 +1104,7 @@ def build_demo(
                         r_txt,
                         final_instruct,
                         ns, gs, dn, sp, du, pp, po,
+                        position_temperature_value,
                         asr_backend, add_ref_punctuation,
                     )
                     return (
@@ -1097,6 +1124,7 @@ def build_demo(
                         single_path,
                         final_instruct,
                         ns, gs, dn, sp, du, pp, po,
+                        position_temperature_value=position_temperature_value,
                         ref_text=r_txt or None,
                         asr_backend=asr_backend,
                         add_ref_punctuation=add_ref_punctuation,
@@ -1149,6 +1177,7 @@ def build_demo(
                 set_du,
                 set_pp,
                 set_po,
+                set_pt,
                 asr_backend_select,
                 ref_punctuation,
             ],
