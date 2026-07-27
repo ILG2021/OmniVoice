@@ -452,6 +452,8 @@ def _build_asr_transcriber(
 
 last_cleanup_times = {}
 cleanup_lock = threading.Lock()
+rng_loaded = False # 在一台设备上，某个初始状态的效果很好，抽卡率高，其他条件完全一致，也是这个趋势，就只能复制状态了
+model_device = "cuda"
 
 
 def delete_old_files_and_dirs(path, days=2):
@@ -507,6 +509,26 @@ def build_demo(
                 f"参考音频过长（{duration:.1f}s > {asr_max_duration:g}s），"
                 "请上传更短的参考音频。"
             )
+    
+    def restore_init_rng():
+        if os.path.exists(os.path.join("models","rng_best.pt")):
+            global model_device
+            print("model_device", model_device)
+            rng_state = torch.load(
+                os.path.join("models","rng_best.pt"),
+                map_location="cpu",
+                weights_only=True,
+            )
+
+            torch.cuda.set_rng_state(
+                rng_state,
+                device=model_device,
+            )
+            print("初始化为init版本状态")
+            return "已恢复到init版本的最初状态"
+        else:
+            print("未找到最佳rng")
+            return "不支持此功能"
 
     # -- shared generation core --
     def _gen_core(
@@ -608,6 +630,11 @@ def build_demo(
                 if instruct and instruct.strip():
                     kw["instruct"] = instruct.strip()
 
+                global rng_loaded, model_device
+                model_device = model.device
+                if not rng_loaded:
+                    rng_loaded = True
+                    restore_init_rng()
                 audio = model.generate(**kw)
         except Exception as e:
             logging.error(
@@ -972,10 +999,15 @@ def build_demo(
                     allow_custom_value=False,
                     interactive=True,
                 )
-                ref_punctuation = gr.Checkbox(
-                    label="sherpa参考文本包含标点",
-                    value=False,
-                )
+                with gr.Row():
+                    ref_punctuation = gr.Checkbox(
+                        label="sherpa参考文本包含标点",
+                        value=False,
+                    )
+                    btn_restore_init = gr.Button(
+                        "恢复到init初始状态",
+                        variant="primary"
+                    )
                         
         # 高级设置与设计选项
         with gr.Row():
@@ -1158,6 +1190,12 @@ def build_demo(
         ref_audio_multi.clear(
             lambda: (None, gr.update(value="")),
             outputs=[merged_ref_audio, ref_text],
+            queue=False,
+        )
+        btn_restore_init.click(
+            restore_init_rng,
+            inputs=[],
+            outputs=[out_status],
             queue=False,
         )
 
