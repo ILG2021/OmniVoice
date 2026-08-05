@@ -1127,18 +1127,12 @@ def build_demo(
 
                 paths = _get_paths(r_aud)
                 n_audio = len(paths)
-                # Synthesis text is a line-based script. For multi-line text,
-                # synthesize each non-empty line separately and concatenate it.
-                text_lines = [line for line in (text or "").splitlines() if line.strip()]
 
                 # 批量模式：多个音频文件
-                if n_audio > 1 or len(text_lines) > 1:
-                    batch_paths = paths
-                    if n_audio == 1 and len(text_lines) > 1:
-                        batch_paths = paths * len(text_lines)
+                if n_audio > 1:
                     audio_out, status, preview, file_paths, resolved_ref_text = _batch_gen_fn(
                         model_name, text, lang,
-                        batch_paths,
+                        paths,
                         r_txt,
                         final_instruct,
                         ns, gs, dn, sp, du, pp, po,
