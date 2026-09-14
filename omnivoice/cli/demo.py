@@ -53,7 +53,6 @@ import torchaudio
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
-from omnivoice.utils.audio import cross_fade_chunks
 
 # ---------------------------------------------------------------------------
 # Language list — all 600+ supported languages
@@ -360,6 +359,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_whisper_audio_compatibility():
+    """Let ASR use NumPy audio when an installed TorchCodec cannot load."""
+    from transformers.pipelines import automatic_speech_recognition as asr_pipeline
+
+    if not asr_pipeline.is_torchcodec_available():
+        return
+    try:
+        import torchcodec  # noqa: F401
+    except (ImportError, OSError, RuntimeError) as exc:
+        # Transformers checks package presence, then imports TorchCodec even
+        # for decoded NumPy input. Disable only this optional ASR decoder path;
+        # keep the normal NumPy preprocessing and resampling implementation.
+        asr_pipeline.is_torchcodec_available = lambda: False
+        logging.warning(
+            "TorchCodec cannot load; Whisper will use decoded audio arrays. %s",
+            exc,
+        )
+
+
 def _build_asr_transcriber(
     backend: str,
     model_name: Optional[str],
@@ -410,6 +428,8 @@ def _build_asr_transcriber(
                     or _WHISPER_ASR_CONFIG != whisper_config
                 ):
                     from transformers import pipeline as hf_pipeline
+
+                    _ensure_whisper_audio_compatibility()
 
                     asr_dtype = (
                         torch.float16
@@ -678,6 +698,11 @@ def build_demo(
         return output_path, "完成。", output_path, resolved_ref_text
 
     def _save_edited_audio(audio_path, target_path):
+        if isinstance(target_path, list):
+            available = [path for path in target_path if os.path.isfile(path)]
+            if not available:
+                return "没有可下载的音频，请重新生成。", target_path, None
+            return f"正在下载 {len(available)} 条独立音频。", target_path, available
         if not audio_path:
             return  "没有可保存的音频。", target_path, None
 
@@ -696,7 +721,7 @@ def build_demo(
                 return (
                     f"已保存：{os.path.basename(target_path)}",
                     target_path,
-                    target_path,
+                    [target_path],
                 )
             data, sample_rate = _load_audio_numpy(audio_path)
             mono = data.mean(axis=0) if data.ndim == 2 else data.squeeze()
@@ -707,7 +732,7 @@ def build_demo(
         return (
             f"已保存：{os.path.basename(target_path)}",
             target_path,
-            target_path,
+            [target_path],
         )
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces). The UI-only
@@ -734,7 +759,7 @@ def build_demo(
         position_temperature_value,
         asr_backend, add_ref_punctuation,
     ):
-        """批量生成：每行 text 对应一个参考音频文件，检查数量一致后逐条生成，拼接为单个音频文件输出。"""
+        """批量生成：每行 text 对应一个参考音频文件，检查数量一致后逐条生成，输出多个独立音频文件。"""
         # --- 解析文件列表 ---
         if isinstance(audio_files, str):
             paths = [audio_files]
@@ -777,7 +802,6 @@ def build_demo(
                 return ref_lines[0]
             return None
 
-        output_sampling_rate = None  # 由各段实际采样率决定，拼接时统一
         gen_dir = "gen_audio"
         os.makedirs(gen_dir, exist_ok=True)
         delete_old_files_and_dirs(gen_dir, days=2)
@@ -810,7 +834,7 @@ def build_demo(
             resolved_ref_texts.append(resolved_ref_text or "")
             if saved_path and os.path.exists(saved_path):
                 # The single-item path is already PCM WAV; copy it without
-                # decoding or re-encoding before concatenation.
+                # decoding or re-encoding.
                 shutil.copyfile(saved_path, out_path)
                 generated_paths.append(out_path)
             else:
@@ -830,66 +854,11 @@ def build_demo(
             status += f"，{len(errors)} 条失败：" + "；".join(errors)
         status += "。"
 
-        # --- 拼接所有生成音频为单文件 ---
-        segments = []
-        for p in generated_paths:
-            data, sr = sf.read(p, dtype="float32", always_2d=False)  # WAV 中间文件直接用 soundfile
-            if data.ndim == 1:
-                data = data[np.newaxis, :]   # (T,) → (1, T)
-            elif data.ndim == 2:
-                data = data.T                # (T, C) → (C, T)
-            if output_sampling_rate is None:
-                output_sampling_rate = sr
-            elif sr != output_sampling_rate:
-                # 采样率不一致时重采样对齐（正常情况下不会触发）
-                t = torch.from_numpy(data)
-                data = torchaudio.functional.resample(
-                    t, orig_freq=sr, new_freq=output_sampling_rate
-                ).numpy()
-            segments.append(data)  # (C, T)
-        # 拼接：加 0.5 s 静音区 + 交叉淡化
-        merged_audio = cross_fade_chunks(
-            segments,
-            sample_rate=output_sampling_rate,
-            silence_duration=1.0,
-        ).squeeze(0)  # (1, T) → (T,)
-
-        # 文件名：与 _gen_core 保持一致，ref_basename 为各参考音频名以 "+" 拼接
-        # 文件系统限制：Linux/macOS 255 字节，Windows NTFS 255 字符；统一按字节控制
-        _FNAME_MAX_BYTES = 255
-        ref_stems = [
-            _safe_filename_part(os.path.basename(p).rpartition(".")[0])
-            for p in (paths if paths else [])
-        ]
-        speed_label = sp if sp is not None else 1.0
-        ref_basename = "+".join(ref_stems) if ref_stems else "batch"
-        # 先算出除 ref_basename 外的固定字节开销
-        fixed = (
-            f"{_safe_filename_part(model_name)}----spd{speed_label}--"
-            f"{batch_suffix}.wav"
-        ).encode("utf-8")
-        max_ref_bytes = _FNAME_MAX_BYTES - len(fixed)
-        if len(ref_basename.encode("utf-8")) > max_ref_bytes:
-            suffix = f"+…({len(ref_stems)})"
-            budget = max_ref_bytes - len(suffix.encode("utf-8"))
-            # 按字节截断，再安全解码（避免切断多字节字符）
-            ref_basename = (
-                ref_basename.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
-                + suffix
-            )
-        merged_fname = (
-            f"{_safe_filename_part(model_name)}--"
-            f"{_safe_filename_part(ref_basename)}--"
-            f"spd{speed_label}--{batch_suffix}.wav"
-        )
-        merged_path = os.path.join(gen_dir, merged_fname)
-        _write_wav(merged_path, merged_audio, output_sampling_rate)
-
         return (
-            merged_path,
-            status,
-            merged_path,
-            merged_path,
+            generated_paths[0],
+            status + "可逐条下载，或点击下载获取全部音频。",
+            generated_paths,
+            generated_paths,
             "\n".join(resolved_ref_texts),
         )
 
@@ -905,15 +874,20 @@ def build_demo(
     .gradio-container .prose {font-size: 1.1em !important;}
     .compact-audio audio {height: 60px !important;}
     .compact-audio .waveform {min-height: 80px !important;}
-    #vc_download_file {display: none !important;}
     """
 
     auto_download_js = """
     () => {
         setTimeout(() => {
             const links = document.querySelectorAll('#vc_download_file a[href]');
-            const link = links[links.length - 1];
-            if (link) link.click();
+            const seen = new Set();
+            let delay = 0;
+            for (const link of links) {
+                if (seen.has(link.href)) continue;
+                seen.add(link.href);
+                setTimeout(() => link.click(), delay);
+                delay += 500;
+            }
         }, 500);
         return [];
     }
@@ -944,7 +918,7 @@ def build_demo(
                 placeholder="请输入要合成的文本……（批量模式：每行一条，行数需与参考音频个数一致）",
             )
             out_audio = gr.Audio(
-                    label="合成结果",
+                    label="音频试听（批量默认第一条）",
                     type="filepath",
                     autoplay=True,
                     format="wav",
@@ -953,9 +927,10 @@ def build_demo(
                 )
             out_audio_path = gr.State(value=None)
             download_file = gr.File(
-                    label="下载文件",
+                    label="生成结果文件（可逐条下载）",
                     elem_id="vc_download_file",
-                    show_label=False,
+                    show_label=True,
+                    interactive=False,
                     file_count="multiple",
                     visible=True,
                 )
@@ -1161,7 +1136,7 @@ def build_demo(
                         asr_backend=asr_backend,
                         add_ref_punctuation=add_ref_punctuation,
                     )
-                    return audio_out, status, saved, saved, resolved_ref_text
+                    return audio_out, status, saved, [saved] if saved else None, resolved_ref_text
             except gr.Error:
                 raise  # _gen_core 已记录日志，直接透传
             except Exception as e:
