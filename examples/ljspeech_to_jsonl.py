@@ -146,7 +146,7 @@ def main():
         help="Directory where train.jsonl (and optionally dev.jsonl) will be written.",
     )
     parser.add_argument(
-        "--dev_count", type=int, default=100,
+        "--dev_count", type=int, default=10,
         help="Number of samples to hold out for the dev set (default: 100). "
              "Set to 0 or use --no_split to output a single train.jsonl instead.",
     )
